@@ -123,7 +123,6 @@ bool Memory::loadDataSection(std::ifstream& imageFileStream) {
     return false;
 }
 
-
 // Dumps memory contents for a specified range to the given output stream.
 void Memory::dumpMemoryRange(std::ostream& out, long startAddr, long endAddr) const {
     long effectiveStartAddr = std::max(0L, startAddr);
