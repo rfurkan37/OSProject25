@@ -4,7 +4,7 @@
 
 #include "memory.h"
 #include "instruction.h" // For Instruction and OpCode definitions
-#include "common.h"
+#include "common.h"      // For memory layout constants and CpuEvent
 #include <vector>
 #include <string>
 #include <functional> // For std::function (to handle PRN syscall output)
@@ -29,7 +29,7 @@ public:
 
     // (Optional) Getters for CPU state, useful for debugging or OS
     bool isInUserMode() const { return user_mode_flag_; }
-    long getCurrentProgramCounter() const; // Reads from memory_[0]
+    long getCurrentProgramCounter() const; // Reads from memory_[PC_ADDR]
 
 private:
     Memory &memory_;                                       // Reference to the system memory
@@ -50,14 +50,26 @@ private:
     long getSP() const;
     void setSP(long new_sp);
     void incrementInstructionCounter();
-    void setSystemCallResult(long result_code);
+    void setCpuEvent(CpuEvent event)
+    {
+        memory_.write(CPU_OS_COMM_ADDR, static_cast<long>(event));
+    }
+    // Removed setSystemCallResult, using memory_.write(CPU_OS_COMM_ADDR, ...) directly with CpuEvent.
 };
 
+// Custom exception for user mode memory access violations
 class UserMemoryFaultException : public std::runtime_error
 {
 public:
     long faulting_address;
     UserMemoryFaultException(const std::string &msg, long addr) : std::runtime_error(msg), faulting_address(addr) {}
 };
+
+// Custom exception for arithmetic faults (New)
+class ArithmeticFaultException : public std::runtime_error {
+public:
+    ArithmeticFaultException(const std::string& msg) : std::runtime_error(msg) {}
+};
+
 
 #endif // CPU_H

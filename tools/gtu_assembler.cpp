@@ -359,7 +359,7 @@ int main(int argc, char *argv[])
                 }
             }
 
-            if (args.size() != expected_args)
+            if (static_cast<int>(args.size()) != expected_args)
             {
                 std::cerr << "Error L" << line_number << " (Instruction): Mnemonic '" << full_mnemonic_for_error
                           << "' expects " << expected_args << " arguments, got " << args.size()

@@ -51,7 +51,7 @@ void Memory::clear()
 }
 
 // Loads the "Data Section" from a program file stream into memory.
-bool Memory::loadDataSection(std::ifstream &imageFileStream)
+bool Memory::loadDataSection(std::ifstream &imageFileStream, int& linesReadCount)
 {
     if (!imageFileStream.is_open() || imageFileStream.eof())
     {
@@ -65,6 +65,7 @@ bool Memory::loadDataSection(std::ifstream &imageFileStream)
     // First, find "Begin Data Section"
     while (std::getline(imageFileStream, line))
     {
+        linesReadCount++; // Count lines read for error reporting
         // Trim whitespace and comments
         size_t commentPos = line.find('#');
         if (commentPos != std::string::npos)
@@ -93,6 +94,7 @@ bool Memory::loadDataSection(std::ifstream &imageFileStream)
     // Now process lines until "End Data Section"
     while (std::getline(imageFileStream, line))
     {
+        linesReadCount++; // Count lines read for error reporting
         // Trim whitespace and comments
         size_t commentPos = line.find('#');
         if (commentPos != std::string::npos)

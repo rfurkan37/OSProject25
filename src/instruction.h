@@ -52,7 +52,7 @@ inline std::string opCodeToString(OpCode op)
         "USER",
         "SYSCALL_PRN", "SYSCALL_HLT_THREAD", "SYSCALL_YIELD",
         "UNKNOWN"};
-    if (static_cast<int>(op) < opCodeStrings.size())
+    if (static_cast<size_t>(op) < opCodeStrings.size())
     {
         return opCodeStrings[static_cast<int>(op)];
     }

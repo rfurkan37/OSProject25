@@ -29,7 +29,7 @@ public:
     // Format within data section: "address value" (e.g., "0 0", "10 50").
     // Ignores comments (#) and empty lines.
     // Returns true on success, false on failure (e.g., file not found, parse error, section markers missing).
-    bool loadDataSection(std::ifstream &imageFileStream); // Takes an open file stream
+    bool loadDataSection(std::ifstream &imageFileStream, int& lines_read_count); // Takes an open file stream
 
     // Dumps memory contents for a specified range to the given output stream.
     // Prints each address and its content in the format "address:value".

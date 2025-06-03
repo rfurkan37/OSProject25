@@ -29,13 +29,6 @@ void CPU::reset()
 {
     halted_flag_ = false;
     user_mode_flag_ = false; // Start in kernel mode
-    // PC, SP, INSTR_COUNT, SYSCALL_RESULT are assumed to be set appropriately
-    // in memory by the OS loader or by their initial values in the data segment.
-    // If a "true" CPU reset is needed where these are zeroed:
-    // memory_.write(PC_ADDR, 0);
-    // memory_.write(SP_ADDR, initial_sp_value); // e.g., memory_.getSize() - 1 for stack top
-    // memory_.write(INSTR_COUNT_ADDR, 0);
-    // memory_.write(CPU_OS_COMM_ADDR, 0);
 }
 
 // --- Register Access Helper Methods ---
@@ -63,11 +56,6 @@ void CPU::incrementInstructionCounter()
 {
     long current_count = memory_.read(INSTR_COUNT_ADDR);
     memory_.write(INSTR_COUNT_ADDR, current_count + 1);
-}
-
-void CPU::setSystemCallResult(long result_code)
-{
-    memory_.write(CPU_OS_COMM_ADDR, result_code);
 }
 
 long CPU::getCurrentProgramCounter() const
@@ -101,7 +89,7 @@ long CPU::checkedRead(long address)
         // Registers 0-20 are always accessible
         // Memory >= 1000 is accessible
         // Memory 21-999 is OS area, forbidden in user mode
-        if (address >= USER_MODE_PROTECTED_MEMORY_START && address <= USER_MODE_PROTECTED_MEMORY_END)
+        if (address >= USER_MEMORY_START_ADDR && address <= OS_DATA_END_ADDR)
         {
             throw UserMemoryFaultException("User mode read access violation", address);
         }
@@ -125,7 +113,7 @@ void CPU::checkedWrite(long address, long value)
 {
     if (user_mode_flag_)
     {
-        if (address >= USER_MODE_PROTECTED_MEMORY_START && address <= USER_MODE_PROTECTED_MEMORY_END)
+        if (address >= USER_MEMORY_START_ADDR && address <= OS_DATA_END_ADDR)
         {
             throw UserMemoryFaultException("User mode write access violation", address);
         }
@@ -160,10 +148,10 @@ void CPU::step()
                   << (program_instructions_.empty() ? 0 : program_instructions_.size() - 1) << ")." << std::endl;
         if (user_mode_flag_)
         {
-            user_mode_flag_ = false;                                        // Switch to Kernel
-            memory_.write(SAVED_TRAP_PC_ADDR, current_pc);                  // Save faulting PC
-            memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_UNKNOWN_INSTRUCTION); // Or a specific PC_OUT_OF_BOUNDS event
-            setPC(OS_MEMORY_FAULT_HANDLER_PC);                              // Trap to OS
+            user_mode_flag_ = false;                                                                 // Switch to Kernel
+            memory_.write(SAVED_TRAP_PC_ADDR, current_pc);                                           // Save faulting PC
+            memory_.write(CPU_OS_COMM_ADDR, static_cast<long>(CpuEvent::UNKNOWN_INSTRUCTION_FAULT)); // Or a specific PC_OUT_OF_BOUNDS event
+            setPC(OS_MEMORY_FAULT_HANDLER_PC);                                                       // Trap to OS
         }
         else
         {
@@ -306,7 +294,7 @@ void CPU::step()
                 throw std::runtime_error("POP: Invalid number of operands.");
             {
                 long sp = getSP();
-                if (sp >= memory_.getSize())
+                if (static_cast<size_t>(sp) >= memory_.getSize())
                     throw std::runtime_error("Stack underflow during POP (SP out of bounds).");
                 // Similar to PUSH, stack read might need careful consideration of user mode
                 long val_from_stack = checkedRead(sp);
@@ -338,7 +326,7 @@ void CPU::step()
                 throw std::runtime_error("RET: Invalid number of operands.");
             {
                 long sp = getSP();
-                if (sp >= memory_.getSize())
+                if (static_cast<size_t>(sp) >= memory_.getSize())
                     throw std::runtime_error("Stack underflow during RET (SP out of bounds).");
                 long return_addr = checkedRead(sp);
                 setSP(sp + 1);
@@ -391,8 +379,8 @@ void CPU::step()
                     std::cout << val_to_print << std::endl;
                 }
 
-                memory_.write(SAVED_TRAP_PC_ADDR, next_pc); // Save PC of *next* instruction for OS
-                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_SYSCALL_PRN);
+                memory_.write(SAVED_TRAP_PC_ADDR, next_pc);        // Save PC of *next* instruction for OS
+                setCpuEvent(CpuEvent::SYSCALL_PRN);                // Notify OS of syscall
                 memory_.write(SYSCALL_ARG1_PASS_ADDR, instr.arg1); // Pass original address A to OS
                 setPC(OS_SYSCALL_DISPATCHER_PC);                   // OS will handle blocking & scheduling
                 pc_modified_by_instruction = true;
@@ -405,7 +393,7 @@ void CPU::step()
             {
                 user_mode_flag_ = false; // Enter Kernel mode
                 memory_.write(SAVED_TRAP_PC_ADDR, next_pc);
-                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_SYSCALL_HLT_THREAD);
+                setCpuEvent(CpuEvent::SYSCALL_HLT_THREAD); // Notify OS of syscall
                 setPC(OS_SYSCALL_DISPATCHER_PC);
                 pc_modified_by_instruction = true;
             }
@@ -417,7 +405,7 @@ void CPU::step()
             {
                 user_mode_flag_ = false; // Enter Kernel mode
                 memory_.write(SAVED_TRAP_PC_ADDR, next_pc);
-                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_SYSCALL_YIELD);
+                setCpuEvent(CpuEvent::SYSCALL_YIELD); // Notify OS of syscall
                 setPC(OS_SYSCALL_DISPATCHER_PC);
                 pc_modified_by_instruction = true;
             }
@@ -430,10 +418,10 @@ void CPU::step()
                       << ". Instruction: " << instr.original_line << std::endl;
             if (user_mode_flag_)
             {
-                user_mode_flag_ = false;                       // Switch to Kernel
-                memory_.write(SAVED_TRAP_PC_ADDR, current_pc); // Save faulting PC
-                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_UNKNOWN_INSTRUCTION);
-                setPC(OS_MEMORY_FAULT_HANDLER_PC); // Or a generic fault handler
+                user_mode_flag_ = false;                          // Switch to Kernel
+                memory_.write(SAVED_TRAP_PC_ADDR, current_pc);    // Save faulting PC
+                setCpuEvent(CpuEvent::UNKNOWN_INSTRUCTION_FAULT); // Notify OS of unknown instruction
+                setPC(OS_MEMORY_FAULT_HANDLER_PC);                // Or a generic fault handler
                 pc_modified_by_instruction = true;
                 increment_instr_counter_after_execution = false; // Don't count this fault as a full execution by user
             }
@@ -455,7 +443,7 @@ void CPU::step()
         user_mode_flag_ = false; // Switch to Kernel mode
 
         memory_.write(SAVED_TRAP_PC_ADDR, current_pc); // Save faulting PC
-        memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_MEMORY_FAULT_USER);
+        setCpuEvent(CpuEvent::MEMORY_FAULT_USER);      // Notify OS of user mode memory fault
 
         // pass the faulting address to OS for handling
         memory_.write(SYSCALL_ARG1_PASS_ADDR, umf.faulting_address);
