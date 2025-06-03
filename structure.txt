@@ -1,0 +1,21 @@
+.
+├── docs
+├── examples
+│   └── os.g312
+├── makefile
+├── merged_output.txt
+├── src
+│   ├── common.h
+│   ├── cpu.cpp
+│   ├── cpu.h
+│   ├── instruction.h
+│   ├── main.cpp
+│   ├── memory.cpp
+│   ├── memory.h
+│   ├── os_simulator.cpp
+│   └── os_simulator.h
+├── structure.txt
+└── tools
+    └── gtu_assembler.cpp
+
+5 directories, 14 files

@@ -1,0 +1,2265 @@
+===== src/common.h =====
+// src/common.h
+#ifndef COMMON_H
+#define COMMON_H
+
+// Memory-mapped "registers"
+constexpr long PC_ADDR = 0;                // Program Counter
+constexpr long SP_ADDR = 1;                // Stack Pointer
+constexpr long CPU_OS_COMM_ADDR = 2;       // CPU-OS Communication (Syscall type, error codes, results)
+constexpr long INSTR_COUNT_ADDR = 3;       // Total CPU instructions executed by CPU
+constexpr long SAVED_TRAP_PC_ADDR = 4;     // CPU saves user PC here on syscall/trap
+constexpr long SYSCALL_ARG1_PASS_ADDR = 5; // CPU passes first syscall argument (e.g., addr for PRN)
+constexpr long SYSCALL_ARG2_PASS_ADDR = 6; // CPU passes second syscall argument (if any)
+// Add more up to 20 if needed for general CPU-OS comm
+
+// OS specific memory locations (known to CPU for traps/syscalls)
+// These are INSTRUCTION ADDRESSES (i.e., PC values) for the OS handlers
+constexpr long OS_BOOT_START_PC = 0;            // Default PC for OS startup if not specified otherwise
+constexpr long OS_SYSCALL_DISPATCHER_PC = 50;   // Example: OS Syscall dispatcher routine starts at instruction 50
+constexpr long OS_MEMORY_FAULT_HANDLER_PC = 60; // Example: OS Memory fault handler starts at instruction 60
+
+// Codes for CPU_OS_COMM_ADDR (mem[2])
+// CPU -> OS: What happened?
+constexpr long CPU_EVENT_NONE = 0;
+constexpr long CPU_EVENT_SYSCALL_PRN = 1;
+constexpr long CPU_EVENT_SYSCALL_HLT_THREAD = 2;
+constexpr long CPU_EVENT_SYSCALL_YIELD = 3;
+constexpr long CPU_EVENT_MEMORY_FAULT_USER = 4; // User mode memory access violation
+constexpr long CPU_EVENT_UNKNOWN_INSTRUCTION = 5;
+// Add other CPU events/traps if necessary
+
+// OS -> CPU: (Less common for this simple model, but could be used)
+// Example: If OS needs to signal CPU about something specific.
+
+// General constants
+constexpr long USER_MODE_PROTECTED_MEMORY_START = 21; // Start of OS data only area
+constexpr long USER_MODE_PROTECTED_MEMORY_END = 999;  // End of OS data only area
+                                                      // Threads can access 0-20 (registers) and >=1000
+
+// Thread states (for OS Thread Table, not directly used by CPU but good for context)
+constexpr int THREAD_STATE_INVALID = 0;
+constexpr int THREAD_STATE_READY = 1;
+constexpr int THREAD_STATE_RUNNING = 2;
+constexpr int THREAD_STATE_BLOCKED = 3;
+constexpr int THREAD_STATE_TERMINATED = 4;
+
+#endif // COMMON_H===== src/cpu.cpp =====
+// src/cpu.cpp
+#include "cpu.h"
+#include "common.h"
+#include "instruction.h"
+#include <iostream>  // For error messages, potentially for SYSCALL_PRN if callback not used externally
+#include <stdexcept> // For runtime_error
+#include <sstream>   // For formatting error messages
+
+// Constructor
+CPU::CPU(Memory &mem,
+         const std::vector<Instruction> &instructions,
+         std::function<void(long)> prn_callback)
+    : memory_(mem),
+      program_instructions_(instructions),
+      prn_system_call_handler_(prn_callback),
+      halted_flag_(false),
+      user_mode_flag_(false) // CPU starts in KERNEL mode
+{
+    // Ensure memory has minimal size for registers
+    if (memory_.getSize() < 21)
+    { // At least 0-20 for registers
+        throw std::runtime_error("Memory size too small for CPU registers.");
+    }
+    reset(); // Initialize registers from memory (or to defaults if memory is zeroed)
+}
+
+// Resets CPU state
+void CPU::reset()
+{
+    halted_flag_ = false;
+    user_mode_flag_ = false; // Start in kernel mode
+    // PC, SP, INSTR_COUNT, SYSCALL_RESULT are assumed to be set appropriately
+    // in memory by the OS loader or by their initial values in the data segment.
+    // If a "true" CPU reset is needed where these are zeroed:
+    // memory_.write(PC_ADDR, 0);
+    // memory_.write(SP_ADDR, initial_sp_value); // e.g., memory_.getSize() - 1 for stack top
+    // memory_.write(INSTR_COUNT_ADDR, 0);
+    // memory_.write(CPU_OS_COMM_ADDR, 0);
+}
+
+// --- Register Access Helper Methods ---
+long CPU::getPC() const
+{
+    return memory_.read(PC_ADDR);
+}
+
+void CPU::setPC(long new_pc)
+{
+    memory_.write(PC_ADDR, new_pc);
+}
+
+long CPU::getSP() const
+{
+    return memory_.read(SP_ADDR);
+}
+
+void CPU::setSP(long new_sp)
+{
+    memory_.write(SP_ADDR, new_sp);
+}
+
+void CPU::incrementInstructionCounter()
+{
+    long current_count = memory_.read(INSTR_COUNT_ADDR);
+    memory_.write(INSTR_COUNT_ADDR, current_count + 1);
+}
+
+void CPU::setSystemCallResult(long result_code)
+{
+    memory_.write(CPU_OS_COMM_ADDR, result_code);
+}
+
+long CPU::getCurrentProgramCounter() const
+{
+    return getPC();
+}
+
+// --- Memory Access with User Mode Protection ---
+void CPU::handleMemoryViolation(const std::string &operation_type, long address)
+{
+    std::ostringstream errMsg;
+    errMsg << "FATAL: User mode memory access violation during " << operation_type
+           << " at address " << address << ". Thread would be shut down.";
+    // In a full OS sim, this would trigger OS intervention.
+    // For now, we halt the CPU to indicate a critical error.
+    std::cerr << errMsg.str() << std::endl;
+    halted_flag_ = true;
+    throw std::runtime_error(errMsg.str()); // Propagate to stop simulation
+}
+
+// Privileged read: for CPU internal use, e.g., reading PC, SP, which are always accessible
+long CPU::privilegedRead(long address)
+{
+    try
+    {
+        return memory_.read(address);
+    }
+    catch (const std::out_of_range &e)
+    {
+        std::cerr << "FATAL: CPU privileged memory read out of bounds at address "
+                  << address << ". " << e.what() << std::endl;
+        halted_flag_ = true;
+        throw; // Re-throw to stop simulation
+    }
+}
+
+// Checked read: enforces user mode restrictions
+long CPU::checkedRead(long address)
+{
+    if (user_mode_flag_)
+    {
+        // Registers 0-20 are always accessible
+        // Memory >= 1000 is accessible
+        // Memory 21-999 is OS area, forbidden in user mode
+        if (address >= USER_MODE_PROTECTED_MEMORY_START && address <= USER_MODE_PROTECTED_MEMORY_END)
+        {
+            throw UserMemoryFaultException("User mode read access violation", address);
+        }
+    }
+    // If kernel mode, or user mode accessing allowed regions (0-20 or >=1000)
+    try
+    {
+        return memory_.read(address);
+    }
+    catch (const std::out_of_range &e)
+    {
+        std::cerr << "FATAL: CPU memory read out of bounds at address "
+                  << address << ". " << e.what() << std::endl;
+        halted_flag_ = true;
+        throw; // Re-throw to stop simulation
+    }
+}
+
+// Checked write: enforces user mode restrictions
+void CPU::checkedWrite(long address, long value)
+{
+    if (user_mode_flag_)
+    {
+        if (address >= USER_MODE_PROTECTED_MEMORY_START && address <= USER_MODE_PROTECTED_MEMORY_END)
+        {
+            throw UserMemoryFaultException("User mode write access violation", address);
+        }
+    }
+    try
+    {
+        memory_.write(address, value);
+    }
+    catch (const std::out_of_range &e)
+    {
+        std::cerr << "FATAL: CPU memory write out of bounds at address "
+                  << address << ". " << e.what() << std::endl;
+        halted_flag_ = true;
+        throw; // Re-throw to stop simulation
+    }
+}
+
+// --- Main Execution Step ---
+void CPU::step()
+{
+    if (halted_flag_)
+    {
+        return; // CPU is halted, do nothing
+    }
+
+    long current_pc = getPC();
+
+    if (current_pc < 0 || static_cast<size_t>(current_pc) >= program_instructions_.size())
+    {
+        std::cerr << "FATAL: Program Counter (" << current_pc << ") is out of instruction bounds (0-"
+                  << program_instructions_.size() - 1 << ")." << std::endl;
+        halted_flag_ = true;
+        return;
+
+        // OS Trap for invalid PC in user mode? Or always fatal?
+        // For now, let's assume this is a more general CPU fault, potentially OS can't recover.
+        // If in user_mode, could trap to OS.
+        if (user_mode_flag_)
+        {
+            user_mode_flag_ = false;                                        // Switch to Kernel
+            memory_.write(SAVED_TRAP_PC_ADDR, current_pc);                  // Save faulting PC
+            memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_UNKNOWN_INSTRUCTION); // Or a specific PC_OUT_OF_BOUNDS event
+            setPC(OS_MEMORY_FAULT_HANDLER_PC);                              // Or a generic fault handler
+                                                                            // No increment to instruction counter for this type of fault before OS handles
+        }
+        else
+        {
+            halted_flag_ = true; // Kernel mode PC fault is fatal
+        }
+        return;
+    }
+
+    const Instruction &instr = program_instructions_[static_cast<size_t>(current_pc)];
+    long next_pc = current_pc + 1;
+    bool pc_modified_by_instruction = false;
+    bool increment_instr_counter_after_execution = true;
+
+    // --- Execute Instruction ---
+    // This will be a large switch statement
+    // For now, let's just increment PC and instruction count
+    // std::cout << "Executing: " << instr.original_line << " (PC=" << current_pc << ")" << std::endl; // Debug
+
+    try
+    {
+        switch (instr.opcode)
+        {
+        case OpCode::SET: // SET B A (arg1=B, arg2=A)
+            // Direct Set: Set the Ath memory location with number B.
+            if (instr.num_operands != 2)
+                throw std::runtime_error("SET: Invalid number of operands.");
+            checkedWrite(instr.arg2, instr.arg1);
+            break;
+
+        case OpCode::CPY: // CPY A1 A2 (arg1=A1, arg2=A2)
+            // Direct Copy: Copy the content of memory location A1 to memory A2.
+            if (instr.num_operands != 2)
+                throw std::runtime_error("CPY: Invalid number of operands.");
+            {
+                long val_a1 = checkedRead(instr.arg1);
+                checkedWrite(instr.arg2, val_a1);
+            }
+            break;
+
+        case OpCode::CPYI: // CPYI A1 A2 (arg1=A1, arg2=A2)
+            // Indirect Copy: Copy the memory address indexed by A1 to memory address A2.
+            // Example: CPYI 100, 102: if memory address 100 contains 200,
+            // then this instruction copies the contents of memory address 200 to memory location 120. (Spec says 120, should be A2/102)
+            if (instr.num_operands != 2)
+                throw std::runtime_error("CPYI: Invalid number of operands.");
+            {
+                long addr_from_a1 = checkedRead(instr.arg1);           // Get the address (e.g., 200) stored at A1 (e.g., 100)
+                long val_at_indirect_addr = checkedRead(addr_from_a1); // Get content of address 200
+                checkedWrite(instr.arg2, val_at_indirect_addr);        // Write to A2 (e.g., 102 or 120 as per example confusion)
+                                                                       // Assuming A2 from instruction: instr.arg2
+            }
+            break;
+
+        case OpCode::CPYI2:
+            if (instr.num_operands != 2)
+                throw std::runtime_error("CPYI2: Invalid number of operands.");
+            // CPYI2 A1 A2: if mem[A1] contains X, and mem[A2] contains Y,
+            // copy contents of mem[X] to mem[Y].
+            {
+                long address_X_container = instr.arg1;
+                long address_Y_container = instr.arg2;
+
+                long address_X = checkedRead(address_X_container);
+                long address_Y = checkedRead(address_Y_container);
+
+                long value_from_X = checkedRead(address_X);
+                checkedWrite(address_Y, value_from_X);
+            }
+            break;
+
+        case OpCode::ADD: // ADD A B (arg1=A, arg2=B)
+            // Add number B to memory location A
+            if (instr.num_operands != 2)
+                throw std::runtime_error("ADD: Invalid number of operands.");
+            {
+                long val_a = checkedRead(instr.arg1);
+                checkedWrite(instr.arg1, val_a + instr.arg2);
+            }
+            break;
+
+        case OpCode::ADDI: // ADDI A1 A2 (arg1=A1, arg2=A2)
+            // Indirect Add: Add the contents of memory address A2 to address A1.
+            if (instr.num_operands != 2)
+                throw std::runtime_error("ADDI: Invalid number of operands.");
+            {
+                long val_a1 = checkedRead(instr.arg1);
+                long val_a2 = checkedRead(instr.arg2);
+                checkedWrite(instr.arg1, val_a1 + val_a2);
+            }
+            break;
+
+        case OpCode::SUBI: // SUBI A1 A2 (arg1=A1, arg2=A2)
+            // Indirect Subtraction: Subtract the contents of memory address A2 from address A1, put the result in A2
+            if (instr.num_operands != 2)
+                throw std::runtime_error("SUBI: Invalid number of operands.");
+            {
+                long val_a1 = checkedRead(instr.arg1);
+                long val_a2 = checkedRead(instr.arg2);
+                checkedWrite(instr.arg2, val_a1 - val_a2); // Result in A2
+            }
+            break;
+
+        case OpCode::JIF: // JIF A C (arg1=A, arg2=C)
+            // Set the CPU program counter with C if memory location A content is less than or equal to 0
+            if (instr.num_operands != 2)
+                throw std::runtime_error("JIF: Invalid number of operands.");
+            {
+                long val_a = checkedRead(instr.arg1);
+                if (val_a <= 0)
+                {
+                    next_pc = instr.arg2; // Jump to instruction C
+                    pc_modified_by_instruction = true;
+                }
+            }
+            break;
+
+        case OpCode::PUSH: // PUSH A (arg1=A)
+            // Push memory A onto the stack. Stack grows downwards.
+            if (instr.num_operands != 1)
+                throw std::runtime_error("PUSH: Invalid number of operands.");
+            {
+                long sp = getSP();
+                sp--; // Stack grows downwards, so decrement SP first
+                if (sp < 0)
+                    throw std::runtime_error("Stack overflow during PUSH.");
+                setSP(sp);
+                long val_a = checkedRead(instr.arg1);
+                // Stack write should ideally bypass user mode checks if SP is in OS area
+                // but for threads, SP will point to thread's stack.
+                // Using checkedWrite for now. If stack is in OS area and user_mode is on, this might be an issue.
+                // For simplicity: If stack is for a thread, it should be in thread memory >= 1000.
+                // OS stack could be < 1000 but OS runs in kernel mode.
+                checkedWrite(sp, val_a);
+            }
+            break;
+
+        case OpCode::POP: // POP A (arg1=A)
+            // Pop value from stack into memory A.
+            if (instr.num_operands != 1)
+                throw std::runtime_error("POP: Invalid number of operands.");
+            {
+                long sp = getSP();
+                if (sp >= memory_.getSize())
+                    throw std::runtime_error("Stack underflow during POP (SP out of bounds).");
+                // Similar to PUSH, stack read might need careful consideration of user mode
+                long val_from_stack = checkedRead(sp);
+                setSP(sp + 1); // Increment SP after pop
+                checkedWrite(instr.arg1, val_from_stack);
+            }
+            break;
+
+        case OpCode::CALL: // CALL C (arg1=C) (arg2 not used, but struct has it)
+            // Call subroutine at instruction C, push return address.
+            if (instr.num_operands != 1)
+                throw std::runtime_error("CALL: Invalid number of operands.");
+            {
+                long sp = getSP();
+                sp--; // Decrement SP for return address
+                if (sp < 0)
+                    throw std::runtime_error("Stack overflow during CALL.");
+                setSP(sp);
+                // Push current_pc + 1 (the address of the instruction AFTER the CALL)
+                checkedWrite(sp, current_pc + 1);
+                next_pc = instr.arg1; // Jump to instruction C
+                pc_modified_by_instruction = true;
+            }
+            break;
+
+        case OpCode::RET: // RET
+            // Return from subroutine by popping return address.
+            if (instr.num_operands != 0)
+                throw std::runtime_error("RET: Invalid number of operands.");
+            {
+                long sp = getSP();
+                if (sp >= memory_.getSize())
+                    throw std::runtime_error("Stack underflow during RET (SP out of bounds).");
+                long return_addr = checkedRead(sp);
+                setSP(sp + 1);
+                next_pc = return_addr;
+                pc_modified_by_instruction = true;
+            }
+            break;
+
+        case OpCode::HLT: // CPU Halt
+            if (instr.num_operands != 0)
+                throw std::runtime_error("HLT: Invalid number of operands.");
+            halted_flag_ = true;
+            pc_modified_by_instruction = true; // PC effectively stops advancing
+
+            break;
+
+        case OpCode::USER: // USER A (arg1 = A, the memory address containing the target PC)
+            if (instr.num_operands != 0)
+                throw std::runtime_error("USER: Invalid number of operands.");
+            if (user_mode_flag_)
+            {
+                // Already in user mode. This could be an error or a NOP.
+                // For now, let it proceed, OS might use it for re-entry if PC changes.
+                // Or throw std::runtime_error("USER: Already in user mode.");
+            }
+            else
+            {
+                // "Switch to user mode and jump to address contained at location Ard" (Ard is A -> instr.arg1)
+                long target_pc_value = checkedRead(instr.arg1); // Read the value from address A
+                setPC(target_pc_value);                         // Set PC to this new value
+                user_mode_flag_ = true;
+                pc_modified_by_instruction = true;
+                // std::cout << "CPU: Switching to USER mode, PC=" << target_pc_value << std::endl; // Debug
+            }
+            break;
+
+        case OpCode::SYSCALL_PRN: // SYSCALL PRN A (arg1=A)
+            if (instr.num_operands != 1)
+                throw std::runtime_error("SYSCALL PRN: Invalid number of operands.");
+            {
+                user_mode_flag_ = false; // Enter Kernel mode for syscall
+
+                long val_to_print = checkedRead(instr.arg1); // Read happens in kernel mode context
+                if (prn_system_call_handler_)
+                {
+                    prn_system_call_handler_(val_to_print);
+                }
+                else
+                {
+                    std::cout << val_to_print << std::endl;
+                }
+
+                memory_.write(SAVED_TRAP_PC_ADDR, next_pc); // Save PC of *next* instruction for OS
+                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_SYSCALL_PRN);
+                memory_.write(SYSCALL_ARG1_PASS_ADDR, instr.arg1); // Pass original address A to OS
+                setPC(OS_SYSCALL_DISPATCHER_PC);                   // OS will handle blocking & scheduling
+                pc_modified_by_instruction = true;
+            }
+            break;
+
+        case OpCode::SYSCALL_HLT_THREAD: // SYSCALL HLT (Thread Halt)
+            if (instr.num_operands != 0)
+                throw std::runtime_error("SYSCALL HLT_THREAD: Invalid number of operands.");
+            {
+                user_mode_flag_ = false; // Enter Kernel mode
+                memory_.write(SAVED_TRAP_PC_ADDR, next_pc);
+                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_SYSCALL_HLT_THREAD);
+                setPC(OS_SYSCALL_DISPATCHER_PC);
+                pc_modified_by_instruction = true;
+            }
+            break;
+
+        case OpCode::SYSCALL_YIELD: // SYSCALL YIELD
+            if (instr.num_operands != 0)
+                throw std::runtime_error("SYSCALL YIELD: Invalid number of operands.");
+            {
+                user_mode_flag_ = false; // Enter Kernel mode
+                memory_.write(SAVED_TRAP_PC_ADDR, next_pc);
+                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_SYSCALL_YIELD);
+                setPC(OS_SYSCALL_DISPATCHER_PC);
+                pc_modified_by_instruction = true;
+            }
+            break;
+
+        case OpCode::UNKNOWN:
+        default:
+            // Potentially trap to OS if in user mode, or halt if in kernel
+            std::cerr << "FATAL: Unknown or unimplemented opcode encountered at PC " << current_pc
+                      << ". Instruction: " << instr.original_line << std::endl;
+            if (user_mode_flag_)
+            {
+                user_mode_flag_ = false;                       // Switch to Kernel
+                memory_.write(SAVED_TRAP_PC_ADDR, current_pc); // Save faulting PC
+                memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_UNKNOWN_INSTRUCTION);
+                setPC(OS_MEMORY_FAULT_HANDLER_PC); // Or a generic fault handler
+                pc_modified_by_instruction = true;
+                increment_instr_counter_after_execution = false; // Don't count this fault as a full execution by user
+            }
+            else
+            {
+                halted_flag_ = true; // Kernel mode unknown instruction is fatal
+                pc_modified_by_instruction = true;
+            }
+            break;
+        }
+    }
+    catch (const UserMemoryFaultException &umf)
+    {
+        // Handle User Mode Memory Fault
+        std::cerr << "FATAL: User mode memory fault during execution of instruction at PC "
+                  << current_pc << " (" << instr.original_line << "): "
+                  << umf.what() << " at address " << umf.faulting_address << std::endl;
+
+        user_mode_flag_ = false; // Switch to Kernel mode
+
+        memory_.write(SAVED_TRAP_PC_ADDR, current_pc); // Save faulting PC
+        memory_.write(CPU_OS_COMM_ADDR, CPU_EVENT_MEMORY_FAULT_USER);
+
+        // pass the faulting address to OS for handling
+        memory_.write(SYSCALL_ARG1_PASS_ADDR, umf.faulting_address);
+        setPC(OS_MEMORY_FAULT_HANDLER_PC);
+        pc_modified_by_instruction = true;
+        increment_instr_counter_after_execution = false; // Fault is not a complete user instruction
+    }
+    catch (const std::runtime_error &e)
+    { // General runtime errors, e.g., stack overflow, underflow, invalid operands
+        std::cerr << "FATAL: Runtime error during execution of instruction at PC "
+                  << current_pc << " (" << instr.original_line << "): " << e.what() << std::endl;
+        halted_flag_ = true;
+        pc_modified_by_instruction = true; // PC should not advance after a fatal error
+    }
+    catch (const std::out_of_range &e)
+    {
+        // This should ideally be caught by checkedRead/Write making it fatal there,
+        // or if not, it means memory_ is being accessed directly bypassing checks.
+        std::cerr << "Memory access out of range (caught in step) at PC " << current_pc
+                  << " (" << instr.original_line << "): " << e.what() << std::endl;
+        halted_flag_ = true;
+        pc_modified_by_instruction = true;
+    }
+
+    if (increment_instr_counter_after_execution && !halted_flag_)
+    {
+        incrementInstructionCounter();
+    }
+
+    if (!halted_flag_)
+    {
+        if (!pc_modified_by_instruction)
+        {
+            setPC(next_pc);
+        }
+    }
+}===== src/cpu.h =====
+// src/cpu.h
+#ifndef CPU_H
+#define CPU_H
+
+#include "memory.h"
+#include "instruction.h" // For Instruction and OpCode definitions
+#include "common.h"
+#include <vector>
+#include <string>
+#include <functional> // For std::function (to handle PRN syscall output)
+#include <stdexcept>  // For std::runtime_error
+
+class CPU
+{
+public:
+    // Constructor
+    CPU(Memory &mem,
+        const std::vector<Instruction> &instructions,
+        std::function<void(long)> prn_callback);
+
+    // Executes a single instruction cycle
+    void step();
+
+    // Checks if the CPU has been halted by an HLT instruction
+    bool isHalted() const { return halted_flag_; }
+
+    // Resets CPU state (PC, SP from memory, flags, instruction count)
+    void reset();
+
+    // (Optional) Getters for CPU state, useful for debugging or OS
+    bool isInUserMode() const { return user_mode_flag_; }
+    long getCurrentProgramCounter() const; // Reads from memory_[0]
+
+private:
+    Memory &memory_;                                       // Reference to the system memory
+    const std::vector<Instruction> &program_instructions_; // Reference to parsed instructions
+    std::function<void(long)> prn_system_call_handler_;    // Callback for SYSCALL PRN
+
+    bool halted_flag_;    // True if CPU HLT instruction has been executed
+    bool user_mode_flag_; // True if CPU is in user mode, false for kernel mode
+
+    // Helper methods for memory access with user mode protection
+    long privilegedRead(long address); // Internal read, bypasses user mode checks for registers
+    long checkedRead(long address);
+    void checkedWrite(long address, long value);
+    void handleMemoryViolation(const std::string &operation_type, long address);
+
+    // Helper methods for register access (which are memory-mapped)
+    long getPC() const;
+    void setPC(long new_pc);
+    long getSP() const;
+    void setSP(long new_sp);
+    void incrementInstructionCounter();
+    void setSystemCallResult(long result_code);
+};
+
+class UserMemoryFaultException : public std::runtime_error
+{
+public:
+    long faulting_address;
+    UserMemoryFaultException(const std::string &msg, long addr) : std::runtime_error(msg), faulting_address(addr) {}
+};
+
+#endif // CPU_H===== src/instruction.h =====
+// src/instruction.h
+#ifndef INSTRUCTION_H
+#define INSTRUCTION_H
+
+#include <string>
+#include <vector> // For opcode to string mapping if needed
+
+// Enum for operation codes
+enum class OpCode
+{
+    SET,
+    CPY,
+    CPYI,
+    CPYI2, // CPYI2 is optional
+    ADD,
+    ADDI,
+    SUBI,
+    JIF,
+    PUSH,
+    POP,
+    CALL,
+    RET,
+    HLT,
+    USER, // Will be USER A
+    SYSCALL_PRN,
+    SYSCALL_HLT_THREAD,
+    SYSCALL_YIELD,
+    UNKNOWN // Placeholder for parsing errors or uninitialized instructions
+};
+
+// Structure to hold a parsed instruction
+struct Instruction
+{
+    OpCode opcode;
+    long arg1;
+    long arg2;
+    int num_operands;
+    std::string original_line; // Store the original instruction string for debugging
+
+    // Default constructor
+    Instruction(OpCode op = OpCode::UNKNOWN, long a1 = 0, long a2 = 0, int num_ops = 0, std::string line = "")
+        : opcode(op), arg1(a1), arg2(a2), num_operands(num_ops), original_line(std::move(line)) {}
+};
+
+// Helper function to convert OpCode to string (optional, for debugging)
+inline std::string opCodeToString(OpCode op)
+{
+    static const std::vector<std::string> opCodeStrings = {
+        "SET", "CPY", "CPYI", "CPYI2",
+        "ADD", "ADDI", "SUBI", "JIF",
+        "PUSH", "POP", "CALL", "RET", "HLT",
+        "USER",
+        "SYSCALL_PRN", "SYSCALL_HLT_THREAD", "SYSCALL_YIELD",
+        "UNKNOWN"};
+    if (static_cast<int>(op) < opCodeStrings.size())
+    {
+        return opCodeStrings[static_cast<int>(op)];
+    }
+    return "INVALID_OPCODE";
+}
+
+#endif // INSTRUCTION_H===== src/main.cpp =====
+// src/sim.cpp
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <stdexcept> // For std::runtime_error
+#include <unordered_map>
+#include <algorithm> // For std::transform (string to uppercase)
+#include <limits>    // For std::numeric_limits
+
+#include "memory.h"
+#include "cpu.h" // This should also bring in OpCode and Instruction struct
+
+// Global map for mnemonics to OpCode. Defined here for parseInstructionSection.
+const std::unordered_map<std::string, OpCode> MNEMONIC_TO_OPCODE = {
+    {"SET", OpCode::SET}, {"CPY", OpCode::CPY}, {"CPYI", OpCode::CPYI}, {"CPYI2", OpCode::CPYI2}, // Add if implementing
+    {"ADD", OpCode::ADD},
+    {"ADDI", OpCode::ADDI},
+    {"SUBI", OpCode::SUBI},
+    {"JIF", OpCode::JIF},
+    {"PUSH", OpCode::PUSH},
+    {"POP", OpCode::POP},
+    {"CALL", OpCode::CALL},
+    {"RET", OpCode::RET},
+    {"HLT", OpCode::HLT},
+    {"USER", OpCode::USER} // USER A is a 1-operand instruction
+};
+
+// Forward declaration for our instruction parser
+std::vector<Instruction> parseInstructionSection(std::ifstream &fileStream, const std::string &filename);
+
+// PRN system call handler
+void handlePrnSyscall(long value)
+{
+    std::cout << value << std::endl;
+}
+
+// Function to dump memory (used by debug modes)
+void dumpMemoryForDebug(const Memory &mem, int debug_mode, bool after_halt = false)
+{
+    if (debug_mode == 0 && after_halt)
+    {                                        // D0: only after halt
+        mem.dumpImportantRegions(std::cerr); // Or full dump if preferred
+        // Or use mem.dumpMemoryRange(std::cerr, 0, mem.getSize() -1); for full dump
+    }
+    else if (debug_mode == 1)
+    { // D1: after each instruction
+        // "the contents of the memory will be sent to standard error stream
+        // after each CPU instruction execution (memory address and the content for each adress)."
+        // This implies a full dump or at least significant regions.
+        // For simplicity, let's dump important regions. A full dump can be very verbose.
+        // The spec: "(memory address and the content for each adress)" -> This implies full dump.
+        mem.dumpMemoryRange(std::cerr, 0, mem.getSize() - 1);
+    }
+    else if (debug_mode == 2)
+    { // D2: after each instruction + keypress
+        mem.dumpMemoryRange(std::cerr, 0, mem.getSize() - 1);
+        std::cerr << "--- Press ENTER to continue to next tick ---" << std::endl;
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        // Or just std::cin.get(); if single char is enough and robust across platforms
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2 || argc > 3)
+    {
+        std::cerr << "Usage: ./sim <program_filename> [-D <0|1|2>]" << std::endl;
+        return 1;
+    }
+
+    std::string filename = argv[1];
+    int debug_mode = -1; // Default: no debug output beyond PRN
+
+    if (argc == 3)
+    {
+        std::string debug_flag_arg = argv[2];
+        if (debug_flag_arg.length() >= 2 && (debug_flag_arg.substr(0, 2) == "-D" || debug_flag_arg.substr(0, 2) == "-d"))
+        {
+            if (debug_flag_arg.length() == 3)
+            { // e.g. -D0
+                try
+                {
+                    debug_mode = std::stoi(debug_flag_arg.substr(2, 1));
+                    if (debug_mode < 0 || debug_mode > 2)
+                    {
+                        std::cerr << "Error: Invalid debug mode. Must be 0, 1, or 2." << std::endl;
+                        return 1;
+                    }
+                }
+                catch (const std::invalid_argument &ia)
+                {
+                    std::cerr << "Error: Invalid debug mode value. Must be an integer." << std::endl;
+                    return 1;
+                }
+                catch (const std::out_of_range &oor)
+                {
+                    std::cerr << "Error: Debug mode value out of range." << std::endl;
+                    return 1;
+                }
+            }
+            else if (debug_flag_arg.length() > 3 && debug_flag_arg[2] == ' ')
+            { // e.g. -D 0 (not specified, but common)
+                try
+                {
+                    debug_mode = std::stoi(debug_flag_arg.substr(3));
+                    if (debug_mode < 0 || debug_mode > 2)
+                    {
+                        std::cerr << "Error: Invalid debug mode. Must be 0, 1, or 2." << std::endl;
+                        return 1;
+                    }
+                }
+                catch (const std::invalid_argument &ia)
+                {
+                    std::cerr << "Error: Invalid debug mode value. Must be an integer." << std::endl;
+                    return 1;
+                }
+                catch (const std::out_of_range &oor)
+                {
+                    std::cerr << "Error: Debug mode value out of range." << std::endl;
+                    return 1;
+                }
+            }
+            else
+            {
+                std::cerr << "Error: Malformed debug flag. Use -D0, -D1, or -D2." << std::endl;
+                return 1;
+            }
+        }
+        else
+        {
+            std::cerr << "Error: Invalid debug flag format. Use -D<0|1|2>." << std::endl;
+            return 1;
+        }
+    }
+
+    Memory systemMemory(11000); // Default size, can be configurable later
+    std::vector<Instruction> programInstructions;
+
+    std::ifstream programFile(filename);
+    if (!programFile.is_open())
+    {
+        std::cerr << "Error: Could not open program file '" << filename << "'." << std::endl;
+        return 1;
+    }
+
+    // 1. Load Data Section
+    if (!systemMemory.loadDataSection(programFile))
+    {
+        std::cerr << "Error loading data section from '" << filename << "'. Ensure format is correct and markers exist." << std::endl;
+        programFile.close();
+        return 1;
+    }
+    // programFile stream is now positioned after "End Data Section"
+
+    // 2. Parse Instruction Section
+    try
+    {
+        programInstructions = parseInstructionSection(programFile, filename);
+    }
+    catch (const std::runtime_error &e)
+    {
+        std::cerr << "Error parsing instruction section: " << e.what() << std::endl;
+        programFile.close();
+        return 1;
+    }
+    programFile.close(); // Done with the file
+
+    // Check if PC is initialized (memory[0] should have a value from data section)
+    // If not, and there are instructions, it's an issue.
+    // The problem spec implies BIOS sets PC from memory[0].
+    // "BIOS will read both data segment and instruction segment, then it will start executing
+    // starting from the PC which is stored in address zero."
+    // So, the data section should define memory[0]. If it's 0 and instructions exist, it's okay.
+
+    if (programInstructions.empty())
+    {
+        std::cout << "Warning: No instructions found or parsed in '" << filename << "'. Program may only contain data." << std::endl;
+        // If PC is non-zero but no instructions, it's an error. If PC is 0 and no instructions, it might just halt or do nothing.
+        // This might be fine for a data-only file, or an OS that's entirely data-driven for setup (unlikely here).
+    }
+
+    // 3. Create CPU
+    CPU gtu_cpu(systemMemory, programInstructions, handlePrnSyscall);
+    // gtu_cpu.reset(); // Constructor calls reset, so not strictly needed here unless re-running
+
+    // 4. Run Simulation Loop
+    try
+    {
+        while (!gtu_cpu.isHalted())
+        {
+            gtu_cpu.step();
+            if (debug_mode == 1 || debug_mode == 2)
+            {
+                dumpMemoryForDebug(systemMemory, debug_mode);
+            }
+        }
+    }
+    catch (const std::runtime_error &e)
+    {
+        // This can catch errors propagated from CPU::step (e.g., memory violations)
+        std::cerr << "Simulation stopped due to runtime error: " << e.what() << std::endl;
+        // Dump memory on error if not already covered by D1/D2, or if D0 is active
+        if (debug_mode == 0 || debug_mode == -1)
+        { // If D0 or no debug, dump on error.
+            std::cerr << "--- Memory state at time of error ---" << std::endl;
+            dumpMemoryForDebug(systemMemory, 0, true); // Use D0 dump logic
+        }
+        return 1; // Indicate error exit
+    }
+
+    // After HLT or if loop finishes (e.g. no instructions)
+    // std::cout << "CPU Halted." << std::endl; // CPU HLT message is handled in CPU::step usually
+    if (debug_mode == 0)
+    {
+        dumpMemoryForDebug(systemMemory, debug_mode, true);
+    }
+
+    // Final instruction count from memory
+    // std::cout << "Total instructions executed: " << systemMemory.read(3) << std::endl;
+
+    return 0;
+}
+
+// --- Instruction Parsing Implementation ---
+std::vector<Instruction> parseInstructionSection(std::ifstream &fileStream, const std::string &filename_for_error_msg)
+{
+    std::vector<Instruction> instructions;
+    std::string line;
+    bool inInstructionSection = false;
+    int line_number_for_errors = 0; // Track original line number for better errors
+
+    // First, find "Begin Instruction Section"
+    // Need to track lines from where data section ended.
+    // This simple line counter might not be accurate if data section parsing also read lines.
+    // A better way would be to count lines from the start of the file for error reporting,
+    // but for now, this counts lines *within* this function's scope of reading.
+
+    while (std::getline(fileStream, line))
+    {
+        line_number_for_errors++;
+        // Trim whitespace and comments
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+        {
+            line = line.substr(0, commentPos);
+        }
+        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+
+        if (line == "Begin Instruction Section")
+        {
+            inInstructionSection = true;
+            break;
+        }
+    }
+
+    if (!inInstructionSection)
+    {
+        // This can happen if the file ends or "End Data Section" was the last thing.
+        // It's not necessarily an error if no instructions are intended.
+        // std::cerr << "Warning: 'Begin Instruction Section' marker not found in " << filename_for_error_msg << std::endl;
+        return instructions; // Return empty vector
+    }
+
+    int instruction_index_within_section = 0;
+    while (std::getline(fileStream, line))
+    {
+        line_number_for_errors++;
+        std::string original_line_for_instr = line; // Keep original for Instruction struct
+
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+        {
+            line = line.substr(0, commentPos);
+        }
+        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+
+        if (line == "End Instruction Section")
+        {
+            break; // End of instructions
+        }
+
+        if (line.empty())
+        {
+            continue; // Skip empty lines
+        }
+
+        // The first token is "line_number_in_section" which we ignore for parsing the instruction itself,
+        // but it's good for validation or if we were to support labels that resolve to these numbers.
+        // For now, the CPU PC is an index into the vector, so these explicit numbers are mostly for human readability.
+
+        std::istringstream iss(line);
+        int parsed_line_num_in_file; // The '0', '1', '2' at the start of instruction lines
+        std::string mnemonic_str;
+
+        iss >> parsed_line_num_in_file; // Read and discard/validate the instruction line number
+        if (iss.fail() || parsed_line_num_in_file != instruction_index_within_section)
+        {
+            // Allow for flexible line numbering, or enforce strict sequential?
+            // Spec "0 SET 10 50" implies it's part of the line.
+            // For now, let's assume it's present but we primarily use vector index for PC.
+            // If it's not the expected sequential number, it might be a format error.
+            // Let's be lenient for now and just ensure we read it.
+            // If it's crucial, add stricter check:
+            // if (parsed_line_num_in_file != instruction_index_within_section) {
+            //    throw std::runtime_error("Instruction line number mismatch at '" + original_line_for_instr + "'. Expected " + std::to_string(instruction_index_within_section));
+            // }
+        }
+
+        iss >> mnemonic_str;
+        std::transform(mnemonic_str.begin(), mnemonic_str.end(), mnemonic_str.begin(), ::toupper); // To uppercase
+
+        Instruction instr;
+        instr.original_line = original_line_for_instr; // Store full original line
+        long arg1_val = 0, arg2_val = 0;
+
+        // Temporary string stream for parsing operands for current line
+        std::string operands_part_str;
+        // iss is from the full line. We need to advance it past instr_line_idx and mnemonic.
+        // Example line: "0 SET 10, 50"
+        // iss already had "0" and "SET" extracted.
+        // The rest of the line is in iss.
+        std::getline(iss, operands_part_str); // Get " 10, 50" (with leading space)
+
+        // Trim leading space from operands_part_str
+        operands_part_str.erase(0, operands_part_str.find_first_not_of(" \t"));
+
+        if (mnemonic_str == "SYSCALL")
+        {
+            std::istringstream ops_iss(operands_part_str);
+            std::string syscall_type_str;
+            ops_iss >> syscall_type_str; // PRN, HLT, YIELD
+            std::transform(syscall_type_str.begin(), syscall_type_str.end(), syscall_type_str.begin(), ::toupper);
+
+            if (syscall_type_str == "PRN")
+            {
+                instr.opcode = OpCode::SYSCALL_PRN;
+                instr.num_operands = 1;
+                if (!(ops_iss >> arg1_val))
+                    throw std::runtime_error("SYSCALL PRN: Missing address argument. Line: " + original_line_for_instr);
+                instr.arg1 = arg1_val;
+
+                std::string junk;
+                if (ops_iss >> junk && !junk.empty() && junk[0] != '#')
+                {
+                    throw std::runtime_error("SYSCALL PRN: Too many operands or trailing characters. Line: " + original_line_for_instr);
+                }
+            }
+            else if (syscall_type_str == "HLT")
+            {
+                instr.opcode = OpCode::SYSCALL_HLT_THREAD;
+                instr.num_operands = 0;
+                std::string junk;
+                if (ops_iss >> junk && !junk.empty() && junk[0] != '#')
+                {
+                    throw std::runtime_error("SYSCALL HLT: Too many operands or trailing characters. Line: " + original_line_for_instr);
+                }
+            }
+            else if (syscall_type_str == "YIELD")
+            {
+                instr.opcode = OpCode::SYSCALL_YIELD;
+                instr.num_operands = 0;
+                std::string junk;
+                if (ops_iss >> junk && !junk.empty() && junk[0] != '#')
+                {
+                    throw std::runtime_error("SYSCALL YIELD: Too many operands or trailing characters. Line: " + original_line_for_instr);
+                }
+            }
+            else
+            {
+                throw std::runtime_error("Unknown SYSCALL type: " + syscall_type_str + ". Line: " + original_line_for_instr);
+            }
+        }
+        else
+        {
+            auto it = MNEMONIC_TO_OPCODE.find(mnemonic_str);
+            if (it == MNEMONIC_TO_OPCODE.end())
+            {
+                throw std::runtime_error("Unknown mnemonic: " + mnemonic_str + ". Line: " + original_line_for_instr);
+            }
+            instr.opcode = it->second;
+
+            // Determine operands based on opcode more robustly
+            std::vector<std::string> arg_tokens;
+            std::istringstream ops_iss(operands_part_str);
+            std::string temp_arg_token;
+
+            while (ops_iss >> temp_arg_token)
+            {
+                if (temp_arg_token == ",")
+                    continue;
+                if (!temp_arg_token.empty() && temp_arg_token.back() == ',')
+                {
+                    // If the token ends with a comma, remove it
+                    temp_arg_token.pop_back();
+                    if (!temp_arg_token.empty())
+                    {
+                        arg_tokens.push_back(temp_arg_token);
+                    }
+                }
+                else
+                {
+                    arg_tokens.push_back(temp_arg_token);
+                }
+            }
+
+            // Determine operands based on opcode
+            switch (instr.opcode)
+            {
+            case OpCode::HLT:
+            case OpCode::RET:
+                instr.num_operands = 0;
+                // Check for extra operands
+                if (!arg_tokens.empty())
+                    throw std::runtime_error(mnemonic_str + ": Unexpected operand(s). Line: " + original_line_for_instr);
+            case OpCode::USER: // USER A (arg1=A)
+            case OpCode::PUSH:
+            case OpCode::POP:
+            case OpCode::CALL: // CALL C (arg1=C)
+                instr.num_operands = 1;
+                instr.num_operands = 1;
+                if (arg_tokens.size() != 1)
+                    throw std::runtime_error(mnemonic_str + ": Expects 1 operand. Got: " + std::to_string(arg_tokens.size()) + ". Line: " + original_line_for_instr);
+                try
+                {
+                    instr.arg1 = std::stol(arg_tokens[0]);
+                }
+                catch (const std::exception &e)
+                {
+                    throw std::runtime_error(mnemonic_str + ": Invalid numeric operand '" + arg_tokens[0] + "'. Line: " + original_line_for_instr);
+                }
+                break;
+            case OpCode::SET:  // SET B A (arg1=B, arg2=A)
+            case OpCode::CPY:  // CPY A1 A2
+            case OpCode::CPYI: // CPYI A1 A2
+            case OpCode::CPYI2:
+            case OpCode::ADD:  // ADD A B
+            case OpCode::ADDI: // ADDI A1 A2
+            case OpCode::SUBI: // SUBI A1 A2
+            case OpCode::JIF:  // JIF A C
+                instr.num_operands = 2;
+                if (arg_tokens.size() != 2)
+                    throw std::runtime_error(mnemonic_str + ": Expects 2 operands. Got: " + std::to_string(arg_tokens.size()) + ". Line: " + original_line_for_instr);
+                try
+                {
+                    instr.arg1 = std::stol(arg_tokens[0]);
+                }
+                catch (const std::exception &e)
+                {
+                    throw std::runtime_error(mnemonic_str + ": Invalid numeric operand1 '" + arg_tokens[0] + "'. Line: " + original_line_for_instr);
+                }
+                try
+                {
+                    instr.arg2 = std::stol(arg_tokens[1]);
+                }
+                catch (const std::exception &e)
+                {
+                    throw std::runtime_error(mnemonic_str + ": Invalid numeric operand2 '" + arg_tokens[1] + "'. Line: " + original_line_for_instr);
+                }
+                break;
+            default: // Should not happen if MNEMONIC_TO_OPCODE is complete
+                throw std::runtime_error("Internal parser error: Unhandled opcode in switch. Mnemonic: " + mnemonic_str);
+            }
+        }
+
+        instructions.push_back(instr);
+        instruction_index_within_section++;
+    }
+
+    // Check if "End Instruction Section" was found
+    if (inInstructionSection && line != "End Instruction Section" && !fileStream.eof())
+    {
+        // This means we broke loop for some other reason, or EOF hit mid-section.
+        // If EOF is hit and we were in section, marker is missing.
+        if (fileStream.eof())
+        {
+            throw std::runtime_error("'End Instruction Section' marker not found before EOF in " + filename_for_error_msg);
+        }
+    }
+
+    return instructions;
+}===== src/memory.cpp =====
+// src/memory.cpp
+#include "memory.h"
+#include <sstream>   // For std::istringstream, std::ostringstream
+#include <iomanip>   // For std::setw (optional for dump formatting)
+#include <algorithm> // For std::max, std::min
+
+// Constructor
+Memory::Memory(size_t initialSize) : size_(initialSize)
+{
+    if (initialSize == 0)
+    { // Or a more practical minimum like 21 for registers
+        throw std::invalid_argument("Memory size cannot be zero (or less than minimum required).");
+    }
+    if (initialSize < 21)
+    { // Project implies registers 0-20
+        std::cerr << "Warning: Memory size " << initialSize << " is less than 21 (minimum for registers)." << std::endl;
+    }
+    data_.resize(size_, 0L); // Initialize with zeros
+}
+
+// Helper to check address validity
+void Memory::checkAddress(long address) const
+{
+    if (address < 0 || static_cast<size_t>(address) >= size_)
+    {
+        std::ostringstream errMsg;
+        errMsg << "Memory access violation: Address " << address
+               << " is out of bounds (0-" << size_ - 1 << ").";
+        throw std::out_of_range(errMsg.str());
+    }
+}
+
+// Reads a long value from the specified memory address.
+long Memory::read(long address) const
+{
+    checkAddress(address);
+    return data_[static_cast<size_t>(address)];
+}
+
+// Writes a long value to the specified memory address.
+void Memory::write(long address, long value)
+{
+    checkAddress(address);
+    data_[static_cast<size_t>(address)] = value;
+}
+
+// Clears all memory to zero.
+void Memory::clear()
+{
+    std::fill(data_.begin(), data_.end(), 0L);
+}
+
+// Loads the "Data Section" from a program file stream into memory.
+bool Memory::loadDataSection(std::ifstream &imageFileStream)
+{
+    if (!imageFileStream.is_open() || imageFileStream.eof())
+    {
+        std::cerr << "Error:loadDataSection: File stream is not open or at EOF." << std::endl;
+        return false;
+    }
+
+    std::string line;
+    bool inDataSection = false;
+
+    // First, find "Begin Data Section"
+    while (std::getline(imageFileStream, line))
+    {
+        // Trim whitespace and comments
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+        {
+            line = line.substr(0, commentPos);
+        }
+        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+
+        if (line == "Begin Data Section")
+        {
+            inDataSection = true;
+            break;
+        }
+    }
+
+    if (!inDataSection)
+    {
+        std::cerr << "Error:loadDataSection: 'Begin Data Section' marker not found." << std::endl;
+        // Reset stream position to beginning if caller needs to re-read for instructions
+        // imageFileStream.clear();
+        // imageFileStream.seekg(0, std::ios::beg);
+        return false;
+    }
+
+    // Now process lines until "End Data Section"
+    while (std::getline(imageFileStream, line))
+    {
+        // Trim whitespace and comments
+        size_t commentPos = line.find('#');
+        if (commentPos != std::string::npos)
+        {
+            line = line.substr(0, commentPos);
+        }
+        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+
+        if (line == "End Data Section")
+        {
+            return true; // Successfully loaded data section
+        }
+
+        if (line.empty())
+        { // Skip empty lines
+            continue;
+        }
+
+        std::istringstream iss(line);
+        long address, value;
+        if (!(iss >> address >> value))
+        {
+            std::cerr << "Error:loadDataSection: Invalid data format in line: '" << line << "'. Expected 'address value'." << std::endl;
+            // Continue to try and parse other lines? Or fail hard?
+            // For now, let's fail if any line is malformed within the section.
+            return false;
+        }
+
+        // Check if address is within bounds AFTER parsing
+        if (address < 0 || static_cast<size_t>(address) >= size_)
+        {
+            std::cerr << "Error:loadDataSection: Address " << address
+                      << " from line '" << line << "' is out of memory bounds (0-" << size_ - 1 << ")." << std::endl;
+            return false;
+        }
+
+        try
+        {
+            write(address, value); // Use our checked write, though not strictly necessary for initial load
+        }
+        catch (const std::out_of_range &e)
+        { // Should be caught by the check above, but defense in depth
+            std::cerr << "Error:loadDataSection: " << e.what() << " for line '" << line << "'" << std::endl;
+            return false;
+        }
+    }
+
+    // If we reach here, it means EOF was hit before "End Data Section"
+    std::cerr << "Error:loadDataSection: 'End Data Section' marker not found before EOF." << std::endl;
+    return false;
+}
+
+// Dumps memory contents for a specified range to the given output stream.
+void Memory::dumpMemoryRange(std::ostream &out, long startAddr, long endAddr) const
+{
+    long effectiveStartAddr = std::max(0L, startAddr);
+    long effectiveEndAddr = std::min(static_cast<long>(size_ - 1), endAddr);
+
+    if (effectiveStartAddr > effectiveEndAddr)
+    {
+        return;
+    }
+
+    for (long addr = effectiveStartAddr; addr <= effectiveEndAddr; ++addr)
+    {
+        out << addr << ":" << data_[static_cast<size_t>(addr)] << std::endl;
+    }
+}
+
+// Dumps predefined important regions.
+void Memory::dumpImportantRegions(std::ostream &out) const
+{
+    out << "--- Registers (Memory Mapped: 0-20) ---" << std::endl;
+    dumpMemoryRange(out, 0, 20);
+
+    out << "--- OS Data Area Sample (e.g., 21-99 or as configured) ---" << std::endl;
+    dumpMemoryRange(out, 21, std::min(99L, static_cast<long>(size_ - 1)));
+
+    // For example, show the start of where thread 1's data might be
+    if (size_ > 1000)
+    {
+        out << "--- Thread 1 Data Area Sample (e.g., 1000-1019) ---" << std::endl;
+        dumpMemoryRange(out, 1000, std::min(1019L, static_cast<long>(size_ - 1)));
+    }
+}
+
+// Returns the total size of the memory.
+size_t Memory::getSize() const
+{
+    return size_;
+}===== src/memory.h =====
+// src/memory.h
+#ifndef MEMORY_H
+#define MEMORY_H
+
+#include <vector>
+#include <string>
+#include <iostream>  // For std::ostream
+#include <stdexcept> // For std::out_of_range, std::invalid_argument
+#include <fstream>   // For std::ifstream
+
+class Memory
+{
+public:
+    // Constructor: Initializes memory of a given size with all zeros.
+    // Minimum size of 11000 to accommodate OS and 10 threads' basic data segments.
+    Memory(size_t initialSize = 11000);
+
+    // Reads a long value from the specified memory address.
+    // Throws std::out_of_range if address is invalid.
+    long read(long address) const;
+
+    // Writes a long value to the specified memory address.
+    // Throws std::out_of_range if address is invalid.
+    void write(long address, long value);
+
+    // Loads the "Data Section" from a program file into memory.
+    // The file is expected to contain lines defining initial memory values.
+    // It parses lines starting from "Begin Data Section" until "End Data Section".
+    // Format within data section: "address value" (e.g., "0 0", "10 50").
+    // Ignores comments (#) and empty lines.
+    // Returns true on success, false on failure (e.g., file not found, parse error, section markers missing).
+    bool loadDataSection(std::ifstream &imageFileStream); // Takes an open file stream
+
+    // Dumps memory contents for a specified range to the given output stream.
+    // Prints each address and its content in the format "address:value".
+    // Ensures startAddr and endAddr are within valid bounds.
+    void dumpMemoryRange(std::ostream &out, long startAddr, long endAddr) const;
+
+    // Dumps predefined important regions to the output stream.
+    // This is a utility function for debugging, typically showing registers and OS areas.
+    void dumpImportantRegions(std::ostream &out) const;
+
+    // Returns the total size of the memory (number of long locations).
+    size_t getSize() const;
+
+    // Clears all memory to zero.
+    void clear();
+
+private:
+    std::vector<long> data_;
+    size_t size_; // Stores the actual configured size of the memory
+
+    // Helper to check address validity and throw std::out_of_range if invalid.
+    void checkAddress(long address) const;
+};
+
+#endif // MEMORY_H===== tools/gtu_assembler.cpp =====
+// tools/gtu_assembler.cpp
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <algorithm> // For std::transform, std::remove
+#include <iomanip>   // For std::setw (optional for cleaner output)
+#include <unordered_map>
+
+// Bring in OpCode definition if we want to be super strict,
+// or just use string comparisons for mnemonics.
+// For simplicity here, we'll use string comparisons but map to expected arg counts.
+// If you include ../src/instruction.h, ensure your build system can find it.
+// #include "../src/instruction.h" // Might need to adjust include path
+
+// Define mnemonic properties (name, expected operand count)
+struct MnemonicInfo
+{
+    std::string name;
+    int operand_count;
+    // OpCode opcode_val; // Optional: if mapping to enum
+};
+
+const std::unordered_map<std::string, MnemonicInfo> MNEMONIC_TABLE = {
+    {"SET", {"SET", 2}},
+    {"CPY", {"CPY", 2}},
+    {"CPYI", {"CPYI", 2}},
+    {"CPYI2", {"CPYI2", 2}}, // Optional
+    {"ADD", {"ADD", 2}},
+    {"ADDI", {"ADDI", 2}},
+    {"SUBI", {"SUBI", 2}},
+    {"JIF", {"JIF", 2}},
+    {"PUSH", {"PUSH", 1}},
+    {"POP", {"POP", 1}},
+    {"CALL", {"CALL", 1}},
+    {"RET", {"RET", 0}},
+    {"HLT", {"HLT", 0}},
+    {"USER", {"USER", 1}} // USER A (takes one address operand)
+    // SYSCALL is special
+};
+
+const std::unordered_map<std::string, MnemonicInfo> SYSCALL_SUBTYPE_TABLE = {
+    {"PRN", {"SYSCALL PRN", 1}},
+    {"HLT", {"SYSCALL HLT", 0}}, // Thread HLT
+    {"YIELD", {"SYSCALL YIELD", 0}}};
+
+// Helper to trim whitespace and comments
+std::string trim_and_remove_comments(const std::string &s)
+{
+    std::string result = s;
+    size_t comment_pos = result.find('#');
+    if (comment_pos != std::string::npos)
+    {
+        result = result.substr(0, comment_pos);
+    }
+    // Trim leading whitespace
+    result.erase(0, result.find_first_not_of(" \t\n\r\f\v"));
+    // Trim trailing whitespace
+    result.erase(result.find_last_not_of(" \t\n\r\f\v") + 1);
+    return result;
+}
+
+// Helper to split string by delimiter, handles multiple spaces
+std::vector<std::string> split_string(const std::string &s, char delimiter = ' ')
+{
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(s);
+    while (std::getline(tokenStream, token, delimiter))
+    {
+        // Handle multiple spaces by further check or istringstream property
+        // The default istringstream >> token behavior handles multiple spaces well.
+        // If using getline, need to filter empty tokens if multiple delimiters are together.
+        // For simple space split, istringstream >> is easier:
+    }
+
+    // Reset stream for token extraction
+    tokenStream.clear();
+    tokenStream.str(s);
+    std::string temp_token;
+    while (tokenStream >> temp_token)
+    {
+        tokens.push_back(temp_token);
+    }
+    return tokens;
+}
+
+bool is_number(const std::string &s)
+{
+    if (s.empty())
+        return false;
+    char *end = nullptr;
+    std::strtol(s.c_str(), &end, 10); // Use strtol for robust checking
+    // Check if the entire string was consumed and it's not just a '-' or '+'
+    return (*end == '\0' && !s.empty() && (s.length() > 1 || std::isdigit(s[0])));
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2 || argc > 3)
+    {
+        std::cerr << "Usage: ./gtu_assembler <input_file.g312> [output_file.img]" << std::endl;
+        return 1;
+    }
+
+    std::string input_filename = argv[1];
+    std::string output_filename;
+
+    if (argc == 3)
+    {
+        output_filename = argv[2];
+    }
+    else
+    {
+        size_t dot_pos = input_filename.rfind(".g312");
+        if (dot_pos != std::string::npos)
+        {
+            output_filename = input_filename.substr(0, dot_pos) + ".img";
+        }
+        else
+        {
+            output_filename = input_filename + ".img";
+        }
+    }
+
+    std::ifstream infile(input_filename);
+    if (!infile.is_open())
+    {
+        std::cerr << "Error: Could not open input file '" << input_filename << "'." << std::endl;
+        return 1;
+    }
+
+    std::ofstream outfile(output_filename);
+    if (!outfile.is_open())
+    {
+        std::cerr << "Error: Could not open output file '" << output_filename << "'." << std::endl;
+        infile.close();
+        return 1;
+    }
+
+    std::string line;
+    int line_number = 0;
+    enum class Section
+    {
+        NONE,
+        DATA,
+        INSTRUCTION
+    };
+    Section current_section = Section::NONE;
+    int instruction_pc_counter = 0; // For validating instruction line numbers
+
+    std::vector<std::string> processed_lines; // To store validated lines before writing
+
+    while (std::getline(infile, line))
+    {
+        line_number++;
+        std::string original_line = line; // For error messages
+        std::string processed_line_content = trim_and_remove_comments(line);
+
+        if (processed_line_content.empty())
+        {
+            // outfile << line << std::endl; // Preserve empty lines/comments if desired
+            processed_lines.push_back(line); // Preserve full original line for comments/spacing
+            continue;
+        }
+
+        std::string temp_line_upper = processed_line_content;
+        std::transform(temp_line_upper.begin(), temp_line_upper.end(), temp_line_upper.begin(), ::toupper);
+
+        if (temp_line_upper == "BEGIN DATA SECTION")
+        {
+            if (current_section != Section::NONE)
+            {
+                std::cerr << "Error L" << line_number << ": Unexpected 'Begin Data Section'. Current section: "
+                          << static_cast<int>(current_section) << std::endl;
+                return 1;
+            }
+            current_section = Section::DATA;
+            processed_lines.push_back(processed_line_content);
+            continue;
+        }
+        else if (temp_line_upper == "END DATA SECTION")
+        {
+            if (current_section != Section::DATA)
+            {
+                std::cerr << "Error L" << line_number << ": 'End Data Section' without matching 'Begin'." << std::endl;
+                return 1;
+            }
+            current_section = Section::NONE;
+            processed_lines.push_back(processed_line_content);
+            continue;
+        }
+        else if (temp_line_upper == "BEGIN INSTRUCTION SECTION")
+        {
+            if (current_section != Section::NONE)
+            {
+                std::cerr << "Error L" << line_number << ": Unexpected 'Begin Instruction Section'." << std::endl;
+                return 1;
+            }
+            current_section = Section::INSTRUCTION;
+            instruction_pc_counter = 0; // Reset for new instruction section
+            processed_lines.push_back(processed_line_content);
+            continue;
+        }
+        else if (temp_line_upper == "END INSTRUCTION SECTION")
+        {
+            if (current_section != Section::INSTRUCTION)
+            {
+                std::cerr << "Error L" << line_number << ": 'End Instruction Section' without matching 'Begin'." << std::endl;
+                return 1;
+            }
+            current_section = Section::NONE;
+            processed_lines.push_back(processed_line_content);
+            continue;
+        }
+
+        if (current_section == Section::NONE)
+        {
+            std::cerr << "Error L" << line_number << ": Content '" << processed_line_content << "' outside of any section." << std::endl;
+            return 1;
+        }
+
+        // --- Process lines within sections ---
+        if (current_section == Section::DATA)
+        {
+            std::vector<std::string> tokens = split_string(processed_line_content);
+            if (tokens.size() != 2)
+            {
+                std::cerr << "Error L" << line_number << " (Data): Invalid format. Expected 'address value'. Got: '"
+                          << processed_line_content << "'" << std::endl;
+                return 1;
+            }
+            if (!is_number(tokens[0]) || !is_number(tokens[1]))
+            {
+                std::cerr << "Error L" << line_number << " (Data): Address and value must be integers. Got: '"
+                          << processed_line_content << "'" << std::endl;
+                return 1;
+            }
+            // Valid data line
+            processed_lines.push_back(tokens[0] + " " + tokens[1]); // Reconstruct for consistent spacing
+        }
+        else if (current_section == Section::INSTRUCTION)
+        {
+            std::vector<std::string> tokens = split_string(processed_line_content);
+            if (tokens.empty())
+            { // Should have been caught by processed_line_content.empty()
+                continue;
+            }
+
+            // Validate instruction line number
+            if (!is_number(tokens[0]))
+            {
+                std::cerr << "Error L" << line_number << " (Instruction): Expected line index as first token. Got: '"
+                          << tokens[0] << "'" << std::endl;
+                return 1;
+            }
+            long instr_idx = std::stol(tokens[0]);
+            if (instr_idx != instruction_pc_counter)
+            {
+                // This is a warning for now, as the simulator uses vector index.
+                // But could be an error if strict sequential numbering is required by spec for the .img file.
+                // The example shows "6 SET 2 0" then "7 HLT", so seems sequential.
+                std::cerr << "Warning L" << line_number << " (Instruction): Line index '" << instr_idx
+                          << "' does not match expected sequential PC '" << instruction_pc_counter << "'." << std::endl;
+            }
+
+            if (tokens.size() < 2)
+            { // Must have at least line_idx and mnemonic
+                std::cerr << "Error L" << line_number << " (Instruction): Incomplete instruction. Missing mnemonic. Got: '"
+                          << processed_line_content << "'" << std::endl;
+                return 1;
+            }
+
+            std::string mnemonic = tokens[1];
+            std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(), ::toupper);
+
+            std::vector<std::string> args;
+            int expected_args = -1;
+            std::string full_mnemonic_for_error = mnemonic;
+
+            if (mnemonic == "SYSCALL")
+            {
+                if (tokens.size() < 3)
+                {
+                    std::cerr << "Error L" << line_number << " (Instruction): SYSCALL missing subtype (PRN, HLT, YIELD). Got: '"
+                              << processed_line_content << "'" << std::endl;
+                    return 1;
+                }
+                std::string subtype = tokens[2];
+                std::transform(subtype.begin(), subtype.end(), subtype.begin(), ::toupper);
+                full_mnemonic_for_error += " " + subtype;
+
+                auto it = SYSCALL_SUBTYPE_TABLE.find(subtype);
+                if (it == SYSCALL_SUBTYPE_TABLE.end())
+                {
+                    std::cerr << "Error L" << line_number << " (Instruction): Unknown SYSCALL subtype '" << subtype << "'. Got: '"
+                              << processed_line_content << "'" << std::endl;
+                    return 1;
+                }
+                expected_args = it->second.operand_count;
+                for (size_t i = 3; i < tokens.size(); ++i)
+                { // Args start after PC, MNEMONIC, SUBTYPE
+                    args.push_back(tokens[i]);
+                }
+            }
+            else
+            {
+                auto it = MNEMONIC_TABLE.find(mnemonic);
+                if (it == MNEMONIC_TABLE.end())
+                {
+                    std::cerr << "Error L" << line_number << " (Instruction): Unknown mnemonic '" << mnemonic << "'. Got: '"
+                              << processed_line_content << "'" << std::endl;
+                    return 1;
+                }
+                expected_args = it->second.operand_count;
+                for (size_t i = 2; i < tokens.size(); ++i)
+                { // Args start after PC, MNEMONIC
+                    // Handle comma: if "val1," it's one token. if "val1 ," it's two.
+                    // Simplest for now: assume args are separated by spaces primarily.
+                    // The spec shows "SET -20, 100". This means "val," is one token or we need to parse better.
+                    // Let's assume "split_string" gives "val1," and "val2" or "val1" and "val2"
+                    // For "SET B, A", tokens might be ["idx", "SET", "B,", "A"] or ["idx", "SET", "B", ",", "A"]
+                    // The current split_string is basic. For robustness:
+                    // std::string arg_token_raw = tokens[i];
+                    // if (arg_token_raw.back() == ',') arg_token_raw.pop_back();
+                    // if (!arg_token_raw.empty()) args.push_back(arg_token_raw);
+                    // This doesn't handle "B , A". For now, assume "B,A" or "B A".
+
+                    // Let's refine argument collection to handle one optional comma for 2-arg instructions.
+                    // The first arg token is tokens[2].
+                    // If expected_args == 2:
+                    //   token[2] is arg1. It might have a comma: "val1,".
+                    //   token[3] is arg2.
+                    // If tokens[2] is "val1," and tokens[3] is "val2", it's fine.
+                    // If tokens[2] is "val1" and tokens[3] is "," and tokens[4] is "val2" -> needs better splitter or parser.
+                    // Current split_string will give ["idx", "SET", "B,", "A"] for "idx SET B, A"
+                    // And ["idx", "SET", "B", "A"] for "idx SET B A"
+                    // And ["idx", "SET", "B", ",", "A"] for "idx SET B , A" -> problem for current loop.
+
+                    // Let's reconstruct args more carefully for validation:
+                    // After mnemonic (tokens[1]), all subsequent tokens are potential args or commas.
+                }
+                // Rebuild args vector from tokens[2] onwards, stripping commas from ends of tokens
+                // And skipping standalone comma tokens.
+                for (size_t i = 2; i < tokens.size(); ++i)
+                {
+                    std::string current_arg_token = tokens[i];
+                    if (current_arg_token == ",")
+                        continue; // Skip standalone comma
+                    if (!current_arg_token.empty() && current_arg_token.back() == ',')
+                    {
+                        current_arg_token.pop_back();
+                    }
+                    if (!current_arg_token.empty())
+                    { // Ensure not an empty string after stripping comma
+                        args.push_back(current_arg_token);
+                    }
+                }
+            }
+
+            if (args.size() != expected_args)
+            {
+                std::cerr << "Error L" << line_number << " (Instruction): Mnemonic '" << full_mnemonic_for_error
+                          << "' expects " << expected_args << " arguments, got " << args.size()
+                          << " in '" << processed_line_content << "'" << std::endl;
+                return 1;
+            }
+
+            for (const auto &arg : args)
+            {
+                if (!is_number(arg))
+                {
+                    std::cerr << "Error L" << line_number << " (Instruction): Argument '" << arg << "' for '"
+                              << full_mnemonic_for_error << "' must be an integer. Line: '"
+                              << processed_line_content << "'" << std::endl;
+                    return 1;
+                }
+            }
+
+            // Valid instruction line. Reconstruct it for output for consistent format.
+            std::string validated_instr_line = tokens[0] + " " + mnemonic;
+            if (mnemonic == "SYSCALL")
+            {
+                validated_instr_line += " " + tokens[2]; // Subtype
+            }
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                validated_instr_line += " " + args[i];
+                // Optional: Add comma back if it was "SET B, A" style.
+                // For simplicity, output space separated. The parser in sim.cpp will handle both.
+                // If strict output comma needed:
+                // if (expected_args == 2 && i == 0) validated_instr_line += ",";
+            }
+            processed_lines.push_back(validated_instr_line);
+            instruction_pc_counter++;
+        }
+    }
+
+    // After parsing all lines, write the processed (and original comment/empty) lines
+    for (const auto &p_line : processed_lines)
+    {
+        outfile << p_line << std::endl;
+    }
+
+    std::cout << "Assembly validation successful: '" << input_filename << "' -> '" << output_filename << "'" << std::endl;
+
+    infile.close();
+    outfile.close();
+    return 0;
+}===== examples/os.g312 =====
+# GTU-C312 OS Code
+# ==================
+
+Begin Data Section
+    # CPU Registers (conceptual, already defined by CPU spec)
+    # 0 0 # PC
+    # 1 0 # SP
+    # 2 0 # Syscall Result/Param (OS uses this for syscall type)
+    # 3 0 # Instructions Executed by CPU
+
+    # OS Global Variables
+    4 0   # MEM_OS_CURRENT_THREAD_ID (0 for OS, 1-10 for user)
+    5 1   # MEM_OS_NEXT_SCHEDULE_ID (starts with thread 1)
+    6 3   # MEM_OS_MAX_USER_THREADS (Project requires at least 3 threads)
+    7 6   # MEM_OS_THREAD_ENTRY_SIZE (PC, SP, State, StartTime, ExecsUsed, BlockUntil)
+    8 50  # MEM_OS_THREAD_TABLE_BASE (TCBs start here)
+    9 0   # MEM_OS_TEMP_A (General purpose temp)
+    10 0  # MEM_OS_TEMP_B
+    11 0  # MEM_OS_TEMP_C
+    12 0  # MEM_OS_STATE_READY_VAL
+    13 1  # MEM_OS_STATE_RUNNING_VAL
+    14 2  # MEM_OS_STATE_BLOCKED_VAL
+    15 3  # MEM_OS_STATE_TERMINATED_VAL
+    16 4  # MEM_OS_STATE_INACTIVE_VAL
+    17 100 # MEM_OS_SYSCALL_BLOCK_DURATION (for PRN)
+    18 199 # OS_STACK_POINTER_INITIAL_VAL (OS stack grows down from just before OS code, e.g. 199)
+    19 0   # OS_TEMP_D (another temp, for loop counters etc)
+    20 0   # OS_TEMP_E (another temp, for addresses)
+    21 0   # OS_SYSCALL_ARG_A (For PRN A, CPU puts A here)
+    # Syscall type codes (placed in mem[2] by CPU simulator)
+    # 22 0 # SYSCALL_TYPE_YIELD_CODE
+    # 23 1 # SYSCALL_TYPE_HLT_CODE
+    # 24 2 # SYSCALL_TYPE_PRN_CODE
+    # TCB Offsets from TCB base
+    25 0 # TCB_OFFSET_PC
+    26 1 # TCB_OFFSET_SP
+    27 2 # TCB_OFFSET_STATE
+    28 3 # TCB_OFFSET_START_TIME
+    29 4 # TCB_OFFSET_EXECS_USED
+    30 5 # TCB_OFFSET_BLOCK_UNTIL
+
+
+    # Thread Table (TCBs)
+    # TCB for OS (Thread 0) - Fields: PC, SP, State, StartTime, ExecsUsed, BlockUntil
+    # Addresses: 50=PC, 51=SP, 52=State, 53=StartTime, 54=ExecsUsed, 55=BlockUntil
+    50 200 # OS_TCB_PC (OS_BOOT_START_ADDR)
+    51 199 # OS_TCB_SP (Initial OS Stack Pointer)
+    52 1   # OS_TCB_State (RUNNING)
+    53 0   # OS_TCB_StartTime
+    54 0   # OS_TCB_ExecsUsed
+    55 0   # OS_TCB_BlockUntil
+
+    # TCB for Thread 1 (User Thread)
+    # Addresses: 56=PC, 57=SP, 58=State, 59=StartTime, 60=ExecsUsed, 61=BlockUntil
+    56 1000 # T1_TCB_PC
+    57 1999 # T1_TCB_SP
+    58 4    # T1_TCB_State (INACTIVE initially)
+    59 0    # T1_TCB_StartTime
+    60 0    # T1_TCB_ExecsUsed
+    61 0    # T1_TCB_BlockUntil
+
+    # TCB for Thread 2 (User Thread)
+    # Addresses: 62=PC, 63=SP, 64=State, 65=StartTime, 66=ExecsUsed, 67=BlockUntil
+    62 2000 # T2_TCB_PC
+    63 2999 # T2_TCB_SP
+    64 4    # T2_TCB_State (INACTIVE initially)
+    65 0    # T2_TCB_StartTime
+    66 0    # T2_TCB_ExecsUsed
+    67 0    # T2_TCB_BlockUntil
+
+    # TCB for Thread 3 (User Thread)
+    # Addresses: 68=PC, 69=SP, 70=State, 71=StartTime, 72=ExecsUsed, 73=BlockUntil
+    68 3000 # T3_TCB_PC
+    69 3999 # T3_TCB_SP
+    70 4    # T3_TCB_State (INACTIVE initially)
+    71 0    # T3_TCB_StartTime
+    72 0    # T3_TCB_ExecsUsed
+    73 0    # T3_TCB_BlockUntil
+
+    # ... Up to 10 user threads. For brevity, only 3 shown for full TCB init.
+    # For example, TCB for Thread 4 starts at 74.
+    74 0    # T4_TCB_PC
+    75 0    # T4_TCB_SP
+    76 4    # T4_TCB_State (INACTIVE)
+    77 0    # ... and so on for other TCB fields if Thread 4 exists
+
+    # Initial PC for OS Boot Code (mem[0]) must point to the first OS instruction.
+    0 200 # OS_BOOT_START_ADDR
+End Data Section
+
+Begin Instruction Section
+# ==============================
+# OS Boot and Initialization (OS_BOOT_START_ADDR)
+# ==============================
+200 CPY 18 1           # Set OS Stack Pointer (mem[1]) from MEM_OS_STACK_POINTER_INITIAL_VAL (mem[18])
+201 SET 220 50         # OS_TCB[0].PC (mem[50]) = HANDLE_SYSCALL_ENTRY_ADDR (220)
+202 CPY 1 51           # OS_TCB[0].SP (mem[51]) = current OS SP (mem[1])
+203 CPY 13 9           # TEMP_A (mem[9]) = STATE_RUNNING_VAL (mem[13])
+204 SET 9 52           # OS_TCB[0].State (mem[52]) = content of TEMP_A (mem[9])
+205 CPY 3 53           # OS_TCB[0].StartTime (mem[53]) = current CPU exec count (mem[3])
+206 SET 0 54           # OS_TCB[0].ExecsUsed (mem[54]) = 0
+207 SET 0 55           # OS_TCB[0].BlockUntil (mem[55]) = 0
+
+    # Initialize User Thread TCBs (Mark them as READY)
+208 CPY 12 9           # TEMP_A (mem[9]) = STATE_READY_VAL (mem[12])
+209 SET 9 58           # TCB[1].State (mem[58]) = content of TEMP_A (mem[9])
+210 SET 9 64           # TCB[2].State (mem[64]) = content of TEMP_A (mem[9])
+211 SET 9 70           # TCB[3].State (mem[70]) = content of TEMP_A (mem[9])
+    # PCs and SPs for T1, T2, T3 are already set in Data Section.
+
+    # Set current thread to OS (0) and next to schedule to Thread 1
+212 SET 0 4            # MEM_OS_CURRENT_THREAD_ID (mem[4]) = 0 (OS itself)
+213 SET 1 5            # MEM_OS_NEXT_SCHEDULE_ID (mem[5]) = 1
+
+    # Jump to Scheduler (SCHEDULER_START_ADDR defined as line 300)
+214 SET 300 0          # PC (mem[0]) = 300
+
+# ==============================
+# SYSCALL Handler Entry Point (HANDLE_SYSCALL_ENTRY_ADDR)
+# CPU simulator should:
+# 1. Switch to Kernel mode.
+# 2. Save user PC (instruction *after* SYSCALL) into mem[0].
+# 3. Save user SP into mem[1].
+# 4. Put syscall type code in mem[2] (e.g., 0 for YIELD, 1 for HLT, 2 for PRN).
+# 5. Put syscall argument (e.g., address for PRN for SYSCALL PRN A) in mem[21] (OS_SYSCALL_ARG_A).
+# 6. Set OS PC (mem[0]) to HANDLE_SYSCALL_ENTRY_ADDR (this block, e.g., 220).
+# 7. Set OS SP (mem[1]) to OS stack pointer (value from mem[18] or mem[51]).
+# ==============================
+220 CPY 18 1           # Ensure OS Stack Pointer is set
+221 CPY 4 9            # TEMP_A (mem[9]) = MEM_OS_CURRENT_THREAD_ID (the thread that called syscall)
+
+    # --- Unrolled Save Context & Handle Syscall based on Thread ID ---
+    # IF Current Thread ID == 1
+222 SET 1 10           # TEMP_B (mem[10]) = 1
+223 CPY 9 11           # TEMP_C (mem[11]) = current_thread_id (from TEMP_A)
+224 SUBI 10 11         # TEMP_C = current_thread_id - 1
+225 JIF 11 228         # If current_thread_id <= 1
+226 CPY 10 11          # TEMP_C (mem[11]) = 1
+227 SUBI 9 11          # TEMP_C = 1 - current_thread_id
+228 JIF 11 230         # If 1 <= current_thread_id (Combined: current_thread_id == 1)
+                       # If not 1, JIF fails, fall through to next ID check (at line 240)
+    # Handle Syscall for Thread 1 (TCB at 56-61)
+229 CPY 0 56           # TCB[1].PC (mem[56]) = Saved User PC (from mem[0])
+230 CPY 1 57           # TCB[1].SP (mem[57]) = Saved User SP (from mem[1])
+    # Check syscall type from mem[2]
+231 CPY 2 10           # TEMP_B (mem[10]) = syscall_type
+    # if type == YIELD (assume YIELD code = 0, HLT code = 1, PRN code = 2)
+232 JIF 10 234         # If type <= 0 (is YIELD)
+233 CPY 12 9           # TEMP_A (mem[9]) = STATE_READY_VAL (mem[12])
+234 SET 9 58           # TCB[1].State (mem[58]) = READY
+235 SET 300 0          # Jump to Scheduler (300)
+    # if type == HLT (1)
+236 SET 1 11           # TEMP_C (mem[11]) = 1 (HLT code)
+237 CPY 10 9           # TEMP_A (mem[9]) = syscall_type
+238 SUBI 11 9          # TEMP_A = type - 1
+239 JIF 9 242          # If type - 1 <= 0 (type <= 1)
+240 CPY 11 9           # TEMP_A (mem[9]) = 1
+241 SUBI 10 9          # TEMP_A = 1 - type
+242 JIF 9 244          # If 1 - type <= 0 (type == 1) (HLT)
+243 CPY 15 9           # TEMP_A (mem[9]) = STATE_TERMINATED_VAL (mem[15])
+244 SET 9 58           # TCB[1].State (mem[58]) = TERMINATED
+245 SET 300 0          # Jump to Scheduler (300)
+    # if type == PRN (2)
+246 SET 2 11           # TEMP_C (mem[11]) = 2 (PRN code)
+    # (equality check for 2 for PRN type - similar to HLT)
+    # Assuming it matched PRN:
+247 CPY 14 9           # TEMP_A (mem[9]) = STATE_BLOCKED_VAL (mem[14])
+248 SET 9 58           # TCB[1].State (mem[58]) = BLOCKED
+249 CPY 3 10           # TEMP_B (mem[10]) = current CPU exec count (mem[3])
+250 ADDI 17 10         # TEMP_B += MEM_OS_SYSCALL_BLOCK_DURATION (mem[17])
+251 SET 10 61          # TCB[1].BlockUntil (mem[61]) = TEMP_B
+252 SET 300 0          # Jump to Scheduler (300)
+
+    # IF Current Thread ID == 2 (Instruction line after Thread 1's HLT JIF or fallthrough)
+    # Similar block as above for Thread 1, starting at (e.g.) 253
+    # This checks if TEMP_A (original current_thread_id) is 2
+253 CPY 4 9            # Reload current_thread_id into TEMP_A (mem[9]) (Might have been overwritten by syscall type logic)
+254 SET 2 10           # TEMP_B (mem[10]) = 2
+    # ... (equality check: if TEMP_A == 2) ... jump to T2 handler or fall through
+    # Handler for Thread 2 (TCB at 62-67) - Save PC/SP, update state, jump to scheduler.
+    # ...
+
+    # IF Current Thread ID == 3
+    # ... (similar block for Thread 3, TCB at 68-73) ...
+
+    # Fallthrough if no ID matched (error or OS was current thread - though OS doesn't syscall)
+299 SET 300 0          # Default: Go to Scheduler
+
+# ==============================
+# Scheduler (SCHEDULER_START_ADDR)
+# ==============================
+300 CPY 18 1           # Ensure OS Stack Pointer is set for OS operations
+    # Save OS context to TCB[0] (Optional: only if OS does complex calls/stack usage)
+    # SET 300 50         # TCB[0].PC = 300 (current)
+    # CPY 1 51           # TCB[0].SP = current SP (mem[1])
+
+    # Find next thread to run
+301 CPY 6 19           # TEMP_D (mem[19]) = max_user_threads (e.g., 3 from mem[6])
+302 ADD 19 1           # TEMP_D = max_user_threads + 1 (loop limit for outer search)
+    # Outer loop: iterate at most MAX_USER_THREADS times to find a runnable thread
+303 ADD 19 -1          # Decrement outer loop counter (TEMP_D)
+304 CPY 19 9           # Copy TEMP_D to TEMP_A for JIF (JIF uses memory location content)
+305 JIF 9 450          # If outer loop counter (mem[9]) <= 0, no thread found -> HLT OS (line 450)
+
+306 CPY 5 9            # TEMP_A (mem[9]) = id_to_check (from MEM_OS_NEXT_SCHEDULE_ID mem[5])
+
+    # --- Check Thread 1 ---
+307 SET 1 10           # TEMP_B (mem[10]) = 1 (Thread ID literal for comparison)
+308 CPY 9 11           # TEMP_C (mem[11]) = id_to_check (from TEMP_A)
+309 SUBI 10 11         # TEMP_C = id_to_check - 1
+310 JIF 11 313         # If id_to_check <= 1
+311 CPY 10 11          # TEMP_C (mem[11]) = 1
+312 SUBI 9 11          # TEMP_C = 1 - id_to_check
+313 JIF 11 315         # If 1 <= id_to_check (Combined: id_to_check == 1)
+                       # If not 1, JIF fails, fall through to next ID check (line 340 for T2)
+    # ID is 1. Current state from TCB[1].State (addr 58)
+314 CPY 58 20          # TEMP_E (mem[20]) = TCB[1].State
+    # Check if BLOCKED
+315 CPY 14 11          # TEMP_C (mem[11]) = STATE_BLOCKED_VAL (mem[14])
+316 CPY 20 9           # TEMP_A (mem[9]) = current state (from TEMP_E)
+317 SUBI 11 9          # TEMP_A = state - BLOCKED_VAL
+318 JIF 9 321          # If state <= BLOCKED_VAL
+319 CPY 11 9           # TEMP_A (mem[9]) = BLOCKED_VAL
+320 SUBI 20 9          # TEMP_A = BLOCKED_VAL - state
+321 JIF 9 323          # If BLOCKED_VAL <= state (Combined: state == BLOCKED)
+                       # If not BLOCKED, JIF fails, fall through to READY check (line 329)
+    # Thread 1 is BLOCKED. Check if it can be unblocked.
+322 CPY 61 10          # TEMP_B (mem[10]) = TCB[1].BlockUntil (mem[61])
+323 CPY 3 9            # TEMP_A (mem[9]) = Current CPU Exec Count (mem[3])
+    # We need BlockUntil - CurrentExec <= 0 for JIF to pass for unblocking
+324 CPY 10 20          # TEMP_E (mem[20]) = BlockUntil
+325 SUBI 9 20          # TEMP_E = BlockUntil - CurrentExec (mem[3] has CurrentExec)
+326 JIF 20 328         # If (BlockUntil - CurrentExec) <= 0, then time to unblock
+                       # If JIF fails, still blocked, skip to next part of scheduler
+327 SET 400 0          # JMP to update_next_id_and_loop_scheduler (line 400)
+    # Unblock:
+328 CPY 12 9           # TEMP_A (mem[9]) = STATE_READY_VAL (mem[12])
+329 SET 9 58           # Set TCB[1].State (mem[58]) = READY
+330 CPY 12 20          # TEMP_E (mem[20]) = STATE_READY_VAL (updated state for next check)
+    # Check if READY (either initially or after unblocking)
+331 CPY 12 11          # TEMP_C (mem[11]) = STATE_READY_VAL (mem[12])
+332 CPY 20 9           # TEMP_A (mem[9]) = current state (from TEMP_E, possibly updated to READY)
+333 SUBI 11 9          # TEMP_A = state - READY_VAL
+334 JIF 9 337          # if state <= READY_VAL
+335 CPY 11 9           # TEMP_A (mem[9]) = READY_VAL
+336 SUBI 20 9          # TEMP_A = READY_VAL - state
+337 JIF 9 339          # if READY_VAL <= state (Combined: state == READY)
+                       # If not READY, JIF fails, fall through (line 338 -> 400)
+    # Thread 1 is READY. Dispatch it.
+338 SET 1 4            # MEM_OS_CURRENT_THREAD_ID (mem[4]) = 1
+339 SET 2 5            # MEM_OS_NEXT_SCHEDULE_ID (mem[5]) = 2 (hardcoded T1 -> T2)
+340 SET 500 0          # JMP to Dispatcher (line 500)
+
+    # --- Check Thread 2 --- (Fallthrough from T1 or explicit jump from T1's JIF failures)
+    # Instruction line will be after 340, e.g., 341
+341 CPY 5 9            # TEMP_A (mem[9]) = id_to_check (from MEM_OS_NEXT_SCHEDULE_ID mem[5])
+342 SET 2 10           # TEMP_B (mem[10]) = 2 (Thread ID literal for comparison)
+    # ... (similar logic as Thread 1 for checking ID, state, blocking, readiness)
+    # On ready, for Thread 2:
+    #   SET 2 4            # MEM_OS_CURRENT_THREAD_ID (mem[4]) = 2
+    #   SET 3 5            # MEM_OS_NEXT_SCHEDULE_ID (mem[5]) = 3 (T2 -> T3)
+    #   SET 500 0          # JMP to Dispatcher (line 500)
+    # If not dispatching T2, jump to (or fall through to) check Thread 3 (e.g. line 370)
+
+    # --- Check Thread 3 --- (Fallthrough or jump)
+    # Instruction line e.g., 370
+370 CPY 5 9            # TEMP_A (mem[9]) = id_to_check (from MEM_OS_NEXT_SCHEDULE_ID mem[5])
+371 SET 3 10           # TEMP_B (mem[10]) = 3 (Thread ID literal for comparison)
+    # ... (similar logic as Thread 1 & 2)
+    # On ready, for Thread 3:
+    #   SET 3 4            # MEM_OS_CURRENT_THREAD_ID (mem[4]) = 3
+    #   SET 1 5            # MEM_OS_NEXT_SCHEDULE_ID (mem[5]) = 1 (T3 -> T1 wrap around)
+    #   SET 500 0          # JMP to Dispatcher (line 500)
+    # If not dispatching T3, jump to (or fall through to) update_next_id (line 400)
+
+    # (Label for jump if a thread is checked but not dispatched, or JIF for ID check fails)
+    # This is the target if a specific thread check (T1, T2, or T3) completes
+    # without dispatching that thread.
+400 CPY 5 9            # TEMP_A (mem[9]) = current MEM_OS_NEXT_SCHEDULE_ID (mem[5])
+401 ADD 9 1            # TEMP_A++
+402 CPY 6 10           # TEMP_B (mem[10]) = MAX_USER_THREADS (mem[6], e.g. 3)
+403 CPY 9 11           # TEMP_C (mem[11]) = TEMP_A (new next_id)
+404 SUBI 10 11         # TEMP_C = new_next_id - MAX_USER_THREADS
+    # If new_next_id > MAX_USER_THREADS, then (new_next_id - MAX) will be > 0. JIF will fail.
+    # e.g. MAX=3. new_id=4. (4-3)=1. JIF fails.
+    # e.g. MAX=3. new_id=3. (3-3)=0. JIF passes.
+    # e.g. MAX=3. new_id=1. (1-3)=-2. JIF passes.
+405 JIF 11 407         # If (new_next_id - MAX_USER_THREADS) <= 0, new_next_id is valid (<= MAX)
+                       # If JIF fails, new_next_id was > MAX_USER_THREADS, so wrap around.
+406 SET 1 9            # Wrap around: TEMP_A (mem[9]) = 1
+407 SET 9 5            # Update MEM_OS_NEXT_SCHEDULE_ID (mem[5]) with TEMP_A (mem[9])
+408 SET 303 0          # Loop back to check next thread in scheduler outer loop (line 303)
+
+450 HLT                # Idle/Problem: No thread ready after full scan. Halt OS.
+
+# ==============================
+# Dispatcher (DISPATCHER_START_ADDR)
+# ==============================
+500 CPY 4 9            # TEMP_A (mem[9]) = id_to_run (from MEM_OS_CURRENT_THREAD_ID mem[4])
+
+    # Dispatch Thread 1
+501 SET 1 10           # TEMP_B (mem[10]) = 1
+502 CPY 9 11           # TEMP_C (mem[11]) = id_to_run (from TEMP_A)
+503 SUBI 10 11         # TEMP_C = id_to_run - 1
+504 JIF 11 507         # if id_to_run <= 1
+505 CPY 10 11          # TEMP_C (mem[11]) = 1
+506 SUBI 9 11          # TEMP_C = 1 - id_to_run
+507 JIF 11 509         # if id_to_run == 1
+                       # If not 1, JIF fails, fall through to T2 dispatch (line 516)
+508 CPY 56 0           # PC (mem[0]) = TCB[1].PC (mem[56])
+509 CPY 57 1           # SP (mem[1]) = TCB[1].SP (mem[57])
+510 CPY 13 10          # TEMP_B (mem[10]) = STATE_RUNNING_VAL (mem[13])
+511 SET 10 58          # TCB[1].State (mem[58]) = RUNNING (content of TEMP_B)
+512 CPY 3 10           # TEMP_B (mem[10]) = current CPU exec count (mem[3])
+513 SET 10 59          # TCB[1].StartTime (mem[59]) = current CPU exec (content of TEMP_B)
+514 USER               # Switch to user mode, CPU jumps to PC in mem[0]
+515 HLT                # Should not be reached if USER works. Safety halt / OS error.
+
+    # Dispatch Thread 2 (Fallthrough from T1 JIF fail, or explicit jump)
+    # Instruction line after 515, e.g. 516
+516 SET 2 10           # TEMP_B (mem[10]) = 2
+    # ... (similar equality check for id_to_run == 2) ...
+    # If id_to_run == 2:
+    #   CPY 62 0           # PC = TCB[2].PC (mem[62])
+    #   CPY 63 1           # SP = TCB[2].SP (mem[63])
+    #   CPY 13 10; SET 10 64 # TCB[2].State = RUNNING
+    #   CPY 3 10; SET 10 65  # TCB[2].StartTime = current CPU exec
+    #   USER
+    #   HLT
+    # If not 2, fall through to T3 dispatch (e.g. line 530)
+
+    # Dispatch Thread 3 (Fallthrough from T2 JIF fail, or explicit jump)
+    # Instruction line after T2 block, e.g. 530
+530 SET 3 10           # TEMP_B (mem[10]) = 3
+    # ... (similar equality check for id_to_run == 3) ...
+    # If id_to_run == 3:
+    #   CPY 68 0           # PC = TCB[3].PC (mem[68])
+    #   CPY 69 1           # SP = TCB[3].SP (mem[69])
+    #   CPY 13 10; SET 10 70 # TCB[3].State = RUNNING
+    #   CPY 3 10; SET 10 71  # TCB[3].StartTime = current CPU exec
+    #   USER
+    #   HLT
+
+    # Fallthrough if ID not found in dispatcher (Error case)
+550 SET 300 0          # Error: ID not found in dispatcher, go back to scheduler (line 300)
+
+End Instruction Section
+
+# Makefile for GTU OS Project
+
+# Compiler and flags
+CXX = g++
+CXXFLAGS = -std=c++17 -Wall -Wextra -g # -g for debugging, -O2 for optimization later
+LDFLAGS =
+
+# Source directories
+SRC_DIR = src
+TOOLS_DIR = tools
+EXAMPLES_DIR = examples
+
+# Simulator executable
+SIM_EXEC = gtu_sim
+SIM_SOURCES = $(SRC_DIR)/cpu.cpp $(SRC_DIR)/memory.cpp $(SRC_DIR)/main.cpp # Change main.cpp if you named it os_simulator.cpp
+SIM_OBJECTS = $(SIM_SOURCES:.cpp=.o)
+
+# Assembler executable
+ASSEMBLER_EXEC = $(TOOLS_DIR)/gtu_assembler
+ASSEMBLER_SOURCES = $(TOOLS_DIR)/gtu_assembler.cpp
+ASSEMBLER_OBJECTS = $(ASSEMBLER_SOURCES:.cpp=.o)
+
+# Default target
+all: $(SIM_EXEC) $(ASSEMBLER_EXEC)
+
+# --- Simulator Compilation ---
+$(SIM_EXEC): $(SIM_OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(SRC_DIR)/%.o: $(SRC_DIR)/%.cpp $(SRC_DIR)/common.h $(SRC_DIR)/instruction.h $(SRC_DIR)/cpu.h $(SRC_DIR)/memory.h
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
+
+# --- Assembler Compilation ---
+$(ASSEMBLER_EXEC): $(ASSEMBLER_OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(TOOLS_DIR)/%.o: $(TOOLS_DIR)/%.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+
+# --- Assembling .g312 files to .img ---
+# This rule allows you to type 'make examples/my_program.img'
+# It will find 'examples/my_program.g312' and assemble it.
+$(EXAMPLES_DIR)/%.img: $(EXAMPLES_DIR)/%.g312 $(ASSEMBLER_EXEC)
+	@echo "Assembling $< -> $@"
+	$(ASSEMBLER_EXEC) $< $@
+
+# --- Running the Simulator ---
+# Example: make run FILE=examples/simple_add.img
+# Example: make run_debug FILE=examples/simple_add.img DEBUG_MODE=1
+# Note: This requires the .img file to exist (either manually assembled or via make examples/....img)
+run:
+ifndef FILE
+	$(error FILE is not set. Usage: make run FILE=path/to/your.img)
+endif
+	@echo "Running simulator with $(FILE)..."
+	./$(SIM_EXEC) $(FILE)
+
+run_debug:
+ifndef FILE
+	$(error FILE is not set. Usage: make run_debug FILE=path/to/your.img DEBUG_MODE=<0|1|2|3>)
+endif
+ifndef DEBUG_MODE
+	$(error DEBUG_MODE is not set. Usage: make run_debug FILE=path/to/your.img DEBUG_MODE=<0|1|2|3>)
+endif
+	@echo "Running simulator with $(FILE) in DEBUG_MODE $(DEBUG_MODE)..."
+	./$(SIM_EXEC) $(FILE) -D$(DEBUG_MODE)
+
+
+# --- Clean up ---
+clean:
+	@echo "Cleaning up..."
+	rm -f $(SIM_EXEC) $(ASSEMBLER_EXEC)
+	rm -f $(SRC_DIR)/*.o $(TOOLS_DIR)/*.o
+	rm -f $(EXAMPLES_DIR)/*.img # Be careful with this if you have manually created .img files you want to keep
+	@echo "Clean complete."
+
+# Phony targets (targets that are not files)
+.PHONY: all clean run run_debug
+
+# Optional: A rule to assemble all .g312 files in examples directory
+# Find all .g312 files in EXAMPLES_DIR
+G312_FILES = $(wildcard $(EXAMPLES_DIR)/*.g312)
+# Create corresponding .img file names
+IMG_FILES = $(G312_FILES:.g312=.img)
+
+assemble_all_examples: $(IMG_FILES)
+	@echo "All example .g312 files assembled."
+
+# List object files for dependency tracking more explicitly if headers change
+# This is already implicitly handled by the .o rule dependencies for src files.
+# $(SIM_OBJECTS): $(SRC_DIR)/common.h $(SRC_DIR)/instruction.h $(SRC_DIR)/cpu.h $(SRC_DIR)/memory.h
