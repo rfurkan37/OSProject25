@@ -3,7 +3,6 @@
 #define INSTRUCTION_H
 
 #include <string>
-#include <vector> // For opcode to string mapping if needed
 
 // Enum for operation codes
 enum class OpCode
@@ -22,6 +21,8 @@ enum class OpCode
     RET,
     HLT,
     USER, // Will be USER A
+    STOREI, // Store Indirect: mem[mem[Ptr_Addr]] = mem[Src_Addr]
+    LOADI,  // Load Indirect: mem[Dest_Addr] = mem[mem[Ptr_Addr]]
     SYSCALL_PRN,
     SYSCALL_HLT_THREAD,
     SYSCALL_YIELD,
@@ -42,21 +43,7 @@ struct Instruction
         : opcode(op), arg1(a1), arg2(a2), num_operands(num_ops), original_line(std::move(line)) {}
 };
 
-// Helper function to convert OpCode to string (optional, for debugging)
-inline std::string opCodeToString(OpCode op)
-{
-    static const std::vector<std::string> opCodeStrings = {
-        "SET", "CPY", "CPYI", "CPYI2",
-        "ADD", "ADDI", "SUBI", "JIF",
-        "PUSH", "POP", "CALL", "RET", "HLT",
-        "USER",
-        "SYSCALL_PRN", "SYSCALL_HLT_THREAD", "SYSCALL_YIELD",
-        "UNKNOWN"};
-    if (static_cast<size_t>(op) < opCodeStrings.size())
-    {
-        return opCodeStrings[static_cast<int>(op)];
-    }
-    return "INVALID_OPCODE";
-}
+// Helper function to convert OpCode to string (declared, defined in a .cpp file)
+std::string opCodeToString(OpCode op);
 
 #endif // INSTRUCTION_H

@@ -1,28 +1,33 @@
 // src/memory.cpp
+// src/memory.cpp
 #include "memory.h"
-#include <sstream>   // For std::istringstream, std::ostringstream
-#include <iomanip>   // For std::setw (optional for dump formatting)
-#include <algorithm> // For std::max, std::min
+#include "common.h"
+#include <vector>
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <algorithm> // For std::fill, std::max, std::min
+#include <iomanip> // For std::setw
 
-// Constructor
 Memory::Memory(size_t initialSize) : size_(initialSize)
 {
-    if (initialSize == 0)
-    { // Or a more practical minimum like 21 for registers
-        throw std::invalid_argument("Memory size cannot be zero (or less than minimum required).");
+    if (initialSize == 0) {
+        throw std::invalid_argument("Memory size cannot be zero.");
     }
-    if (initialSize < 21)
-    { // Project implies registers 0-20
-        std::cerr << "Warning: Memory size " << initialSize << " is less than 21 (minimum for registers)." << std::endl;
+    // REGISTERS_END_ADDR is 20, so minimum size is 21 (0-20)
+    if (initialSize < REGISTERS_END_ADDR + 1) {
+        std::cerr << "Warning: Memory size " << initialSize 
+                  << " is less than " << (REGISTERS_END_ADDR + 1) 
+                  << " (minimum for registers)." << std::endl;
     }
-    data_.resize(size_, 0L); // Initialize with zeros
+    data_.resize(size_, 0L);
 }
 
-// Helper to check address validity
 void Memory::checkAddress(long address) const
 {
-    if (address < 0 || static_cast<size_t>(address) >= size_)
-    {
+    if (address < 0 || static_cast<size_t>(address) >= size_) {
         std::ostringstream errMsg;
         errMsg << "Memory access violation: Address " << address
                << " is out of bounds (0-" << size_ - 1 << ").";
@@ -30,160 +35,219 @@ void Memory::checkAddress(long address) const
     }
 }
 
-// Reads a long value from the specified memory address.
 long Memory::read(long address) const
 {
     checkAddress(address);
     return data_[static_cast<size_t>(address)];
 }
 
-// Writes a long value to the specified memory address.
 void Memory::write(long address, long value)
 {
     checkAddress(address);
     data_[static_cast<size_t>(address)] = value;
 }
 
-// Clears all memory to zero.
 void Memory::clear()
 {
     std::fill(data_.begin(), data_.end(), 0L);
 }
 
-// Loads the "Data Section" from a program file stream into memory.
+static std::string trimLine(std::string line)
+{
+    size_t commentPos = line.find('#');
+    if (commentPos != std::string::npos) {
+        line = line.substr(0, commentPos);
+    }
+    line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+    line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+    return line;
+}
+
 bool Memory::loadDataSection(std::ifstream &imageFileStream, int& linesReadCount)
 {
-    if (!imageFileStream.is_open() || imageFileStream.eof())
-    {
-        std::cerr << "Error:loadDataSection: File stream is not open or at EOF." << std::endl;
+    if (!imageFileStream.is_open() || imageFileStream.eof()) {
+        std::cerr << "Error: File stream is not open or at EOF." << std::endl;
         return false;
     }
 
     std::string line;
     bool inDataSection = false;
 
-    // First, find "Begin Data Section"
-    while (std::getline(imageFileStream, line))
-    {
-        linesReadCount++; // Count lines read for error reporting
-        // Trim whitespace and comments
-        size_t commentPos = line.find('#');
-        if (commentPos != std::string::npos)
-        {
-            line = line.substr(0, commentPos);
-        }
-        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
-        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
-
-        if (line == "Begin Data Section")
-        {
+    // Find "Begin Data Section"
+    while (std::getline(imageFileStream, line)) {
+        linesReadCount++;
+        line = trimLine(line);
+        if (line == "Begin Data Section") {
             inDataSection = true;
             break;
         }
     }
 
-    if (!inDataSection)
-    {
-        std::cerr << "Error:loadDataSection: 'Begin Data Section' marker not found." << std::endl;
-        // Reset stream position to beginning if caller needs to re-read for instructions
-        // imageFileStream.clear();
-        // imageFileStream.seekg(0, std::ios::beg);
-        return false;
+    if (!inDataSection) {
+        std::cerr << "Error: 'Begin Data Section' marker not found." << std::endl;
+        // It's possible the file only contains an instruction section, so reset stream for instruction parsing
+        imageFileStream.clear(); // Clear EOF flags
+        imageFileStream.seekg(0, std::ios::beg); // Rewind
+        linesReadCount = 0; // Reset lines read for instruction parser
+        return true; // Not a fatal error for the whole program if data section is optional
     }
 
-    // Now process lines until "End Data Section"
-    while (std::getline(imageFileStream, line))
-    {
-        linesReadCount++; // Count lines read for error reporting
-        // Trim whitespace and comments
-        size_t commentPos = line.find('#');
-        if (commentPos != std::string::npos)
-        {
-            line = line.substr(0, commentPos);
-        }
-        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
-        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+    // Process data lines
+    while (std::getline(imageFileStream, line)) {
+        linesReadCount++;
+        line = trimLine(line);
 
-        if (line == "End Data Section")
-        {
-            return true; // Successfully loaded data section
+        if (line == "End Data Section") {
+            return true;
         }
-
-        if (line.empty())
-        { // Skip empty lines
+        if (line.empty()) {
             continue;
         }
 
         std::istringstream iss(line);
         long address, value;
-        if (!(iss >> address >> value))
-        {
-            std::cerr << "Error:loadDataSection: Invalid data format in line: '" << line << "'. Expected 'address value'." << std::endl;
-            // Continue to try and parse other lines? Or fail hard?
-            // For now, let's fail if any line is malformed within the section.
+        char comma; // To consume potential comma if format is address, value
+
+        // Try parsing "address value"
+        iss >> address;
+        if (iss.fail()) {
+             std::cerr << "Error: Invalid data format (address) in line: '" << line << "' at file line " << linesReadCount << "." << std::endl;
+            return false;
+        }
+        // Check for optional comma
+        if (iss.peek() == ',') {
+            iss >> comma;
+        }
+        iss >> value;
+        if (iss.fail()) {
+             std::cerr << "Error: Invalid data format (value) in line: '" << line << "' at file line " << linesReadCount << "." << std::endl;
             return false;
         }
 
-        // Check if address is within bounds AFTER parsing
-        if (address < 0 || static_cast<size_t>(address) >= size_)
-        {
-            std::cerr << "Error:loadDataSection: Address " << address
-                      << " from line '" << line << "' is out of memory bounds (0-" << size_ - 1 << ")." << std::endl;
+
+        // Check for trailing characters
+        std::string remaining;
+        iss >> remaining;
+        if (!remaining.empty()) {
+            std::cerr << "Error: Trailing characters in data line: '" << line << "' at file line " << linesReadCount << "." << std::endl;
             return false;
         }
 
-        try
-        {
-            write(address, value); // Use our checked write, though not strictly necessary for initial load
-        }
-        catch (const std::out_of_range &e)
-        { // Should be caught by the check above, but defense in depth
-            std::cerr << "Error:loadDataSection: " << e.what() << " for line '" << line << "'" << std::endl;
+
+        try {
+            write(address, value);
+        } catch (const std::out_of_range &e) {
+            std::cerr << "Error: " << e.what() << " (loading line: '" << line << "' at file line " << linesReadCount << ")" << std::endl;
             return false;
         }
     }
 
-    // If we reach here, it means EOF was hit before "End Data Section"
-    std::cerr << "Error:loadDataSection: 'End Data Section' marker not found before EOF." << std::endl;
+    std::cerr << "Error: 'End Data Section' marker not found before EOF." << std::endl;
     return false;
 }
 
-// Dumps memory contents for a specified range to the given output stream.
 void Memory::dumpMemoryRange(std::ostream &out, long startAddr, long endAddr) const
 {
     long effectiveStartAddr = std::max(0L, startAddr);
     long effectiveEndAddr = std::min(static_cast<long>(size_ - 1), endAddr);
 
-    if (effectiveStartAddr > effectiveEndAddr)
-    {
+    if (effectiveStartAddr > effectiveEndAddr || effectiveStartAddr >= static_cast<long>(size_)) { // Added check for start >= size
         return;
     }
 
-    for (long addr = effectiveStartAddr; addr <= effectiveEndAddr; ++addr)
-    {
+    for (long addr = effectiveStartAddr; addr <= effectiveEndAddr; ++addr) {
         out << addr << ":" << data_[static_cast<size_t>(addr)] << std::endl;
     }
 }
 
-// Dumps predefined important regions.
-void Memory::dumpImportantRegions(std::ostream &out) const
+void Memory::dumpMemoryRangeTable(std::ostream &out, long startAddr, long endAddr) const
 {
-    out << "--- Registers (Memory Mapped: 0-20) ---" << std::endl;
-    dumpMemoryRange(out, 0, 20);
+    long effectiveStartAddr = std::max(0L, startAddr);
+    long effectiveEndAddr = std::min(static_cast<long>(size_ - 1), endAddr);
 
-    out << "--- OS Data Area Sample (e.g., 21-99 or as configured) ---" << std::endl;
-    dumpMemoryRange(out, 21, std::min(99L, static_cast<long>(size_ - 1)));
+    if (effectiveStartAddr > effectiveEndAddr || effectiveStartAddr >= static_cast<long>(size_)) {
+        return;
+    }
 
-    // For example, show the start of where thread 1's data might be
-    if (size_ > 1000)
-    {
-        out << "--- Thread 1 Data Area Sample (e.g., 1000-1019) ---" << std::endl;
-        dumpMemoryRange(out, 1000, std::min(1019L, static_cast<long>(size_ - 1)));
+    const int COLS = 10; // 10 columns per row
+    
+    // Print header
+    out << "Addr:  |";
+    for (int i = 0; i < COLS; ++i) {
+        out << std::setw(6) << i << " |";
+    }
+    out << std::endl;
+    
+    // Print separator line
+    out << "-------|";
+    for (int i = 0; i < COLS; ++i) {
+        out << "-------|";
+    }
+    out << std::endl;
+
+    // Print data rows
+    for (long addr = effectiveStartAddr; addr <= effectiveEndAddr; addr += COLS) {
+        long rowStart = addr;
+        long rowEnd = std::min(addr + COLS - 1, effectiveEndAddr);
+        
+        // Print row address
+        out << std::setw(6) << rowStart << " |";
+        
+        // Print values for this row
+        for (long col = 0; col < COLS; ++col) {
+            long currentAddr = rowStart + col;
+            if (currentAddr <= rowEnd) {
+                long value = data_[static_cast<size_t>(currentAddr)];
+                out << std::setw(6) << value << " |";
+            } else {
+                out << "       |"; // Empty cell for addresses beyond range
+            }
+        }
+        out << std::endl;
     }
 }
 
-// Returns the total size of the memory.
-size_t Memory::getSize() const
+void Memory::dumpImportantRegions(std::ostream &out) const
 {
-    return size_;
+    out << "--- Registers (0-" << REGISTERS_END_ADDR << ") - TABLE FORMAT ---" << std::endl;
+    dumpMemoryRangeTable(out, 0, REGISTERS_END_ADDR);
+
+    // OS_DATA_END_ADDR is 999
+    out << "--- OS Data Area (" << OS_DATA_START_ADDR << "-" << OS_DATA_END_ADDR << ") - TABLE FORMAT ---" << std::endl;
+    dumpMemoryRangeTable(out, OS_DATA_START_ADDR, std::min(OS_DATA_END_ADDR, static_cast<long>(size_ - 1)));
+
+    if (size_ > USER_MEMORY_START_ADDR) {
+        // Show extended thread data areas instead of just a small sample
+        
+        // First show a basic sample for context (1000-1019) - use table format for consistency
+        long thread_sample_end_addr = std::min(USER_MEMORY_START_ADDR + 19L, static_cast<long>(size_ - 1));
+        if (thread_sample_end_addr >= USER_MEMORY_START_ADDR) {
+            out << "--- Sample User Area (" << USER_MEMORY_START_ADDR << "-" << thread_sample_end_addr << ") - TABLE FORMAT ---" << std::endl;
+            dumpMemoryRangeTable(out, USER_MEMORY_START_ADDR, thread_sample_end_addr);
+        }
+        
+        // Thread 1 data area (1100-1199) - use table format for compact display
+        long thread1_start = 1100;
+        long thread1_end = std::min(1199L, static_cast<long>(size_ - 1));
+        if (thread1_end >= thread1_start && static_cast<long>(size_) > thread1_start) {
+            out << "--- Thread 1 Data Area (" << thread1_start << "-" << thread1_end << ") - TABLE FORMAT ---" << std::endl;
+            dumpMemoryRangeTable(out, thread1_start, thread1_end);
+        }
+        
+        // Thread 2 data area (1200-1299) - use table format for compact display
+        long thread2_start = 1200;
+        long thread2_end = std::min(1299L, static_cast<long>(size_ - 1));
+        if (thread2_end >= thread2_start && static_cast<long>(size_) > thread2_start) {
+            out << "--- Thread 2 Data Area (" << thread2_start << "-" << thread2_end << ") - TABLE FORMAT ---" << std::endl;
+            dumpMemoryRangeTable(out, thread2_start, thread2_end);
+        }
+        
+        // Thread 3 data area (1300-1399) - use table format for compact display  
+        long thread3_start = 1300;
+        long thread3_end = std::min(1399L, static_cast<long>(size_ - 1));
+        if (thread3_end >= thread3_start && static_cast<long>(size_) > thread3_start) {
+            out << "--- Thread 3 Data Area (" << thread3_start << "-" << thread3_end << ") - TABLE FORMAT ---" << std::endl;
+            dumpMemoryRangeTable(out, thread3_start, thread3_end);
+        }
+    }
 }

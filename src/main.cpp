@@ -4,495 +4,369 @@
 #include <vector>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
-#include <algorithm> // For std::transform, std::remove
-#include <limits>    // For std::numeric_limits
-#include <iomanip>   // For std::setw (used in thread table dump)
+#include <limits>
+#include <iomanip>
+#include <cctype>
 #include <cstring>
 
 #include "memory.h"
-#include "cpu.h"    // This should also bring in OpCode and Instruction struct
-#include "common.h" // For constants like CPU_OS_COMM_ADDR, OS_DATA_START_ADDR etc.
+#include "cpu.h"
+#include "common.h"
+#include "instruction.h"
+#include "parser.h"
 
-// Global map for mnemonics to OpCode. Defined here for parseInstructionSection.
-const std::unordered_map<std::string, OpCode> MNEMONIC_TO_OPCODE = {
-    {"SET", OpCode::SET}, {"CPY", OpCode::CPY}, {"CPYI", OpCode::CPYI}, {"CPYI2", OpCode::CPYI2}, {"ADD", OpCode::ADD}, {"ADDI", OpCode::ADDI}, {"SUBI", OpCode::SUBI}, {"JIF", OpCode::JIF}, {"PUSH", OpCode::PUSH}, {"POP", OpCode::POP}, {"CALL", OpCode::CALL}, {"RET", OpCode::RET}, {"HLT", OpCode::HLT}, {"USER", OpCode::USER}
-    // SYSCALL variants are handled separately in parsing
-};
-
-// Forward declaration for our instruction parser
-std::vector<Instruction> parseInstructionSection(std::ifstream &fileStream, const std::string &filename, int &lineOffset);
-
-// PRN system call handler
 void handlePrnSyscall(long value)
 {
     std::cout << value << std::endl;
 }
 
+// Dump for -D0 (after halt) or -D1/-D2 (after each step)
 void dumpMemoryForDebug(const Memory &mem, int debug_mode, bool after_halt = false)
 {
     if (debug_mode == 0 && after_halt)
     {
+        std::cerr << "--- Memory Dump After Halt ---" << std::endl;
         mem.dumpImportantRegions(std::cerr);
     }
     else if (debug_mode == 1)
     {
+        // std::cerr << "--- Memory Dump After Step ---" << std::endl; // Optional header
         mem.dumpMemoryRange(std::cerr, 0, mem.getSize() - 1);
     }
     else if (debug_mode == 2)
     {
+        std::cerr << "--- Memory Dump After Step ---" << std::endl;
         mem.dumpMemoryRange(std::cerr, 0, mem.getSize() - 1);
         std::cerr << "--- Press ENTER to continue to next tick ---" << std::endl;
         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
-    // Debug mode 3 is handled separately for thread table dump
 }
 
+// Enhanced dump for -D3
 void dumpThreadTableForDebug3(const Memory &mem, std::ostream &out)
 {
-    out << "--- Thread Table Dump (OS Data Area: "
-        << OS_DATA_START_ADDR << "-" << OS_DATA_END_ADDR << ") ---" << std::endl;
+    out << "--- Thread Table Dump ---" << std::endl;
+    out << "TID | PC   | SP   | State | StartT | ExecsU | BlockU" << std::endl;
+    out << "---------------------------------------------------------" << std::endl;
 
-    out << "Addr  | Value     | Likely Meaning (Example OS Convention)" << std::endl;
-    out << "----------------------------------------------------------" << std::endl;
-    bool has_printed_anything = false;
-    for (long addr = OS_DATA_START_ADDR; addr <= OS_DATA_END_ADDR; ++addr)
+    // Read state constant values from memory as defined by os.g312
+    long state_ready_val = mem.read(THREAD_STATE_READY);      // THREAD_STATE_READY_CONST
+    long state_running_val = mem.read(THREAD_STATE_RUNNING);    // THREAD_STATE_RUNNING_CONST
+    long state_blocked_val = mem.read(THREAD_STATE_BLOCKED);    // THREAD_STATE_BLOCKED_CONST
+    long state_terminated_val = mem.read(THREAD_STATE_TERMINATED); // THREAD_STATE_TERMINATED_CONST
+
+    // Read TCB configuration from OS data in memory
+    long tcb_base_addr = mem.read(TCB_TABLE_START); // TCB_TABLE_START_ADDR_CONST
+    long num_threads = mem.read(TOTAL_THREADS);   // num_total_threads_addr
+    long tcb_size = mem.read(TCB_SIZE);      // TCB_SIZE_CONST
+
+    if (tcb_size == 0)
+    { // Prevent division by zero or infinite loop if TCB_SIZE is not set
+        out << "Error: TCB_SIZE_CONST in memory (address 27) is zero. Cannot dump TCB table." << std::endl;
+        return;
+    }
+
+    for (long i = 0; i < num_threads; ++i)
+    { // Use long for i if num_threads can be large, else int
+        long current_tcb_start_addr = tcb_base_addr + i * tcb_size;
+
+        // Check if TCB address is valid to prevent reading out of bounds if config is wrong
+        if (static_cast<size_t>(current_tcb_start_addr + tcb_size - 1) >= mem.getSize())
+        {
+            out << "Error: TCB for thread " << (i + 1) << " would be out of memory bounds." << std::endl;
+            break;
+        }
+
+        out << std::setw(3) << (i + 1) << " | "                               // Assuming thread IDs are 1-based for display
+            << std::setw(4) << mem.read(current_tcb_start_addr + 0) << " | "  // TCB_PC_OFFSET
+            << std::setw(4) << mem.read(current_tcb_start_addr + 1) << " | "; // TCB_SP_OFFSET
+
+        long state_val = mem.read(current_tcb_start_addr + 2); // TCB_State_OFFSET
+        std::string state_str = "UNK(" + std::to_string(state_val) + ")";
+        if (state_val == state_ready_val)
+            state_str = "READY";
+        else if (state_val == state_running_val)
+            state_str = "RUNNG";
+        else if (state_val == state_blocked_val)
+            state_str = "BLOCK";
+        else if (state_val == state_terminated_val)
+            state_str = "TERMD";
+
+        out << std::setw(5) << state_str << " | "
+            << std::setw(6) << mem.read(current_tcb_start_addr + 3) << " | " // TCB_StartTime_OFFSET
+            << std::setw(6) << mem.read(current_tcb_start_addr + 4) << " | " // TCB_ExecsUsed_OFFSET
+            << std::setw(6) << mem.read(current_tcb_start_addr + 5)          // TCB_BlockUntil_OFFSET
+            << std::endl;
+    }
+
+    out << "OS Current Thread ID: " << mem.read(CURRENT_THREAD_ID) << std::endl; // current_thread_id_addr
+    out << "OS Next to Schedule:  " << mem.read(NEXT_THREAD_TO_SCHEDULE) << std::endl; // next_thread_to_schedule_addr
+    out << "CPU Total Instr:      " << mem.read(INSTR_COUNT_ADDR) << std::endl;
+    out << "CPU Event Code:       " << mem.read(CPU_OS_COMM_ADDR) << std::endl;
+    out << "CPU Saved Trap PC:    " << mem.read(SAVED_TRAP_PC_ADDR) << std::endl;
+    out << "CPU Syscall Arg1:     " << mem.read(SYSCALL_ARG1_PASS_ADDR) << std::endl;
+
+    out << "---------------------------------------------------------" << std::endl;
+}
+
+struct ProgramArgs
+{
+    std::string filename;
+    int debug_mode = -1;        // Default to no debug mode explicitly set
+    size_t memory_size = 11000; // Default memory size
+};
+
+ProgramArgs parseArguments(int argc, char *argv[])
+{
+    ProgramArgs args;
+
+    for (int i = 1; i < argc; ++i)
     {
-        long value = mem.read(addr);
-        if (addr < OS_DATA_START_ADDR + 50 || value != 0)
-        { // Heuristic to print some data
-            out << std::setw(5) << addr << " | " << std::setw(9) << value << " | ";
-            // Example interpretation (highly dependent on OS design)
-            if (addr == OS_DATA_START_ADDR)
-                out << "OS Info / Current Thread ID Pointer";
-            else if (addr > OS_DATA_START_ADDR && addr <= OS_DATA_START_ADDR + 100)
+        std::string arg_str = argv[i];
+
+        if (arg_str == "-D")
+        {
+            if (i + 1 < argc && strlen(argv[i + 1]) == 1 && std::isdigit(static_cast<unsigned char>(argv[i + 1][0])))
             {
+                args.debug_mode = std::stoi(argv[++i]);
             }
-            out << std::endl;
-            has_printed_anything = true;
+            else
+            {
+                throw std::runtime_error("Debug flag -D requires a single digit mode (0-3) as the next argument.");
+            }
+        }
+        else if (arg_str.rfind("-D", 0) == 0 && arg_str.length() == 3 && std::isdigit(static_cast<unsigned char>(arg_str[2])))
+        {
+            // Handles -D0, -D1, -D2, -D3
+            args.debug_mode = std::stoi(arg_str.substr(2, 1));
+        }
+        else if (arg_str == "--memory-size" || arg_str == "-m")
+        {
+            if (i + 1 < argc)
+            {
+                try
+                {
+                    args.memory_size = std::stoul(argv[++i]);
+                }
+                catch (const std::exception &e)
+                {
+                    throw std::runtime_error("Invalid value for --memory-size: " + std::string(argv[i]));
+                }
+                if (args.memory_size < USER_MEMORY_START_ADDR)
+                { // USER_MEMORY_START_ADDR is 1000
+                    std::cerr << "Warning: Small memory size " << args.memory_size
+                              << ". Recommended >= " << USER_MEMORY_START_ADDR
+                              << " for OS and threads." << std::endl;
+                }
+                if (args.memory_size == 0)
+                {
+                    throw std::runtime_error("Memory size cannot be zero.");
+                }
+            }
+            else
+            {
+                throw std::runtime_error("--memory-size option requires a value.");
+            }
+        }
+        else if (args.filename.empty())
+        {
+            args.filename = arg_str;
+        }
+        else
+        {
+            throw std::runtime_error("Unknown or misplaced argument: " + arg_str);
         }
     }
-    if (!has_printed_anything)
+
+    if (args.filename.empty())
     {
-        out << "(OS data area is all zeros or not fitting display heuristic)" << std::endl;
+        throw std::runtime_error("Program filename is required.");
     }
-    out << "----------------------------------------------------------" << std::endl;
+
+    if (args.debug_mode != -1 && (args.debug_mode < 0 || args.debug_mode > 3))
+    {
+        throw std::runtime_error("Invalid debug mode specified. Must be 0, 1, 2, or 3.");
+    }
+    if (args.debug_mode == -1)
+        args.debug_mode = 0; // Default to mode 0 if not specified
+
+    return args;
 }
 
 int main(int argc, char *argv[])
 {
     if (argc < 2)
     {
-        std::cerr << "Usage: ./sim <program_filename> [-D<0|1|2|3>] [--memory-size <size_in_longs>]" << std::endl;
+        std::cerr << "Usage: ./gtu_sim <program_filename> [-D<0|1|2|3>] [--memory-size <size_in_longs>]" << std::endl;
         return 1;
     }
 
-    std::string filename = "";
-    int debug_mode = -1;        // Default: no debug output beyond PRN
-    size_t memory_size = 11000; // Default memory size
-
-    for (int i = 1; i < argc; ++i)
+    ProgramArgs args;
+    try
     {
-        std::string arg = argv[i];
-        if (arg.rfind("-D", 0) == 0)
-        { // Starts with -D
-            std::string mode_str;
-            if (arg.length() == 3 && isdigit(arg[2]))
-            { // -D0, -D1, etc.
-                mode_str = arg.substr(2, 1);
-            }
-            else if (arg.length() == 2 && (i + 1 < argc) && isdigit(argv[i + 1][0]) && strlen(argv[i + 1]) == 1)
-            { // -D 0, -D 1
-                mode_str = argv[i + 1];
-                i++; // Consume next argument
-            }
-            else
-            {
-                std::cerr << "Error: Malformed debug flag. Use -D<0|1|2|3> or -D <0|1|2|3>." << std::endl;
-                return 1;
-            }
-            try
-            {
-                debug_mode = std::stoi(mode_str);
-                if (debug_mode < 0 || debug_mode > 3)
-                { // Now includes 3
-                    std::cerr << "Error: Invalid debug mode. Must be 0, 1, 2, or 3." << std::endl;
-                    return 1;
-                }
-            }
-            catch (const std::exception &)
-            {
-                std::cerr << "Error: Invalid debug mode value. Must be an integer 0, 1, 2, or 3." << std::endl;
-                return 1;
-            }
-        }
-        else if (arg == "--memory-size" || arg == "-m")
-        {
-            if (i + 1 < argc)
-            {
-                try
-                {
-                    memory_size = std::stoul(argv[++i]);
-                    if (memory_size < USER_MEMORY_START_ADDR)
-                    { // Minimum reasonable size
-                        std::cerr << "Warning: Specified memory size " << memory_size << " is very small. Recommended >= " << USER_MEMORY_START_ADDR << "." << std::endl;
-                    }
-                    if (memory_size == 0)
-                    {
-                        std::cerr << "Error: Memory size cannot be zero." << std::endl;
-                        return 1;
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    std::cerr << "Error: Invalid memory size value. Must be a positive integer. " << e.what() << std::endl;
-                    return 1;
-                }
-            }
-            else
-            {
-                std::cerr << "Error: --memory-size or -m option requires a value." << std::endl;
-                return 1;
-            }
-        }
-        else if (filename.empty())
-        {
-            filename = arg;
-        }
-        else
-        {
-            std::cerr << "Error: Unknown argument or filename specified twice: " << arg << std::endl;
-            std::cerr << "Usage: ./sim <program_filename> [-D<0|1|2|3>] [--memory-size <size_in_longs>]" << std::endl;
-            return 1;
-        }
+        args = parseArguments(argc, argv);
     }
-
-    if (filename.empty())
+    catch (const std::exception &e)
     {
-        std::cerr << "Error: Program filename is required." << std::endl;
-        std::cerr << "Usage: ./sim <program_filename> [-D<0|1|2|3>] [--memory-size <size_in_longs>]" << std::endl;
+        std::cerr << "Argument Error: " << e.what() << std::endl;
+        std::cerr << "Usage: ./gtu_sim <program_filename> [-D<0|1|2|3>] [--memory-size <size_in_longs>]" << std::endl;
         return 1;
     }
 
-    Memory systemMemory(memory_size); // Default size, can be configurable later
+    Memory systemMemory(args.memory_size);
     std::vector<Instruction> programInstructions;
 
-    std::ifstream programFile(filename);
+    std::ifstream programFile(args.filename);
     if (!programFile.is_open())
     {
-        std::cerr << "Error: Could not open program file '" << filename << "'." << std::endl;
+        std::cerr << "Error: Could not open program file '" << args.filename << "'." << std::endl;
         return 1;
     }
 
     int total_lines_read_for_error = 0;
     if (!systemMemory.loadDataSection(programFile, total_lines_read_for_error))
     {
-        programFile.close();
+        // Error message already printed by loadDataSection
         return 1;
     }
 
-    // 2. Parse Instruction Section
     try
     {
-        programInstructions = parseInstructionSection(programFile, filename, total_lines_read_for_error);
+        // Pass total_lines_read_for_error by reference so it's updated
+        programInstructions = parseInstructionSection(programFile, args.filename, total_lines_read_for_error);
     }
     catch (const std::runtime_error &e)
     {
         std::cerr << "Error parsing instruction section: " << e.what() << std::endl;
-        programFile.close();
         return 1;
     }
-    programFile.close(); // Done with the file
+    programFile.close();
 
-    // Check if PC is initialized (memory[0] should have a value from data section)
-    // If not, and there are instructions, it's an issue.
-    // The problem spec implies BIOS sets PC from memory[0].
-    // "BIOS will read both data segment and instruction segment, then it will start executing
-    // starting from the PC which is stored in address zero."
-    // So, the data section should define memory[0]. If it's 0 and instructions exist, it's okay.
-
-    if (programInstructions.empty())
+    long initial_pc = systemMemory.read(PC_ADDR);
+    if (initial_pc == 0 && programInstructions.empty())
     {
-        std::cout << "Warning: No instructions found or parsed in '" << filename << "'. Program may only contain data or OS is purely data-driven." << std::endl;
+        std::cerr << "Warning: PC is 0 and no instructions loaded. CPU will likely halt or fault immediately." << std::endl;
+    }
+    else if (initial_pc == 0 && !programInstructions.empty() && OS_BOOT_START_PC != 0)
+    {
+        std::cerr << "Warning: Initial PC is 0 from data section. OS boot is expected at "
+                  << OS_BOOT_START_PC << " (or as per data section 0 value). "
+                  << "If OS instructions start at PC 0, this might be fine." << std::endl;
     }
 
-    // 3. Create CPU
     CPU gtu_cpu(systemMemory, programInstructions, handlePrnSyscall);
 
-    long last_cpu_os_comm_val = 0; // For D3 mode, to detect changes
-    long last_pc_for_d3 = -1;      // For D3 mode, to detect jumps to OS handlers
+    int cycle_count = 0;
+    constexpr int MAX_CYCLES = 200000; // Increased max cycles for potentially longer OS runs
 
-    // 4. Run Simulation Loop
-    try
+    bool prev_is_user_mode = gtu_cpu.isInUserMode(); // Initial state before first step
+
+    while (!gtu_cpu.isHalted() && cycle_count < MAX_CYCLES)
     {
-        while (!gtu_cpu.isHalted())
+        // For -D3: condition check *before* step, based on state *about to be caused by OS* or *just caused by thread*
+        // This is tricky. Let's try state change *after* step.
+
+
+        /* long current_pc_for_debug = gtu_cpu.getCurrentProgramCounter();
+        if (current_pc_for_debug >= 0 && static_cast<size_t>(current_pc_for_debug) < programInstructions.size())
         {
-
-            if (debug_mode == 3)
+            // Ensure there's a valid instruction at the PC to prevent crashing the simulator
+            const Instruction &instr_to_exec = programInstructions[static_cast<size_t>(current_pc_for_debug)];
+            if (instr_to_exec.opcode != OpCode::UNKNOWN || !instr_to_exec.original_line.empty())
             {
-                long current_cpu_os_comm = systemMemory.read(CPU_OS_COMM_ADDR);
-                long current_pc = gtu_cpu.getCurrentProgramCounter(); // PC for the *next* instruction
-
-                bool os_handler_jump = (current_pc == OS_SYSCALL_DISPATCHER_PC ||
-                                        current_pc == OS_MEMORY_FAULT_HANDLER_PC ||
-                                        current_pc == OS_ARITHMETIC_FAULT_HANDLER_PC ||
-                                        current_pc == OS_UNKNOWN_INSTRUCTION_HANDLER_PC);
-                if ((current_cpu_os_comm != 0 && current_cpu_os_comm != last_cpu_os_comm_val) ||
-                    (os_handler_jump && current_pc != last_pc_for_d3))
-                {
-                    std::cerr << "--- Debug Mode 3: Context Switch or System Call Detected ---" << std::endl;
-                    if (current_cpu_os_comm != 0)
-                    {
-                        std::cerr << "Event (mem[2]): " << current_cpu_os_comm
-                                  << " (PC for next OS instruction: " << current_pc << ")" << std::endl;
-                    }
-                    else if (os_handler_jump)
-                    {
-                        std::cerr << "Jump to OS handler at PC: " << current_pc << std::endl;
-                    }
-                    dumpThreadTableForDebug3(systemMemory, std::cerr);
-                    if (debug_mode == 3)
-                    { // D3 implies keypress like D2 for this detailed dump
-                        std::cerr << "--- Press ENTER to continue ---" << std::endl;
-                        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-                    }
-                }
-                last_cpu_os_comm_val = current_cpu_os_comm; // Update for next iteration
-                if (current_cpu_os_comm == 0 && os_handler_jump)
-                {
-                    // If comm was cleared but we jumped to OS handler, it's still a notable event.
-                }
-                last_pc_for_d3 = current_pc; // Store PC for next check
-            }
-
-            gtu_cpu.step();
-
-            if (debug_mode == 1 || debug_mode == 2)
-            {
-                dumpMemoryForDebug(systemMemory, debug_mode);
-            }
-
-            // After CPU step, if OS handled event & cleared CPU_OS_COMM_ADDR, update for D3
-            if (debug_mode == 3)
-            {
-                last_cpu_os_comm_val = systemMemory.read(CPU_OS_COMM_ADDR);
-            }
-        }
-    }
-    catch (const std::runtime_error &e)
-    {
-        // This can catch errors propagated from CPU::step (e.g., memory violations)
-        std::cerr << "Simulation stopped due to runtime error: " << e.what() << std::endl;
-        // Dump memory on error if not already covered by D1/D2, or if D0 is active
-        if (debug_mode == 0 || debug_mode == -1)
-        { // If D0 or no debug, dump on error.
-            std::cerr << "--- Memory state at time of error ---" << std::endl;
-            dumpMemoryForDebug(systemMemory, 0, true); // Use D0 dump logic
-        }
-        return 1; // Indicate error exit
-    }
-
-    std::cout << "CPU Halted." << std::endl;
-    if (debug_mode == 0)
-    {
-        dumpMemoryForDebug(systemMemory, debug_mode, true);
-    }
-    // Final D3 dump if halted cleanly, showing final state of thread table
-    if (debug_mode == 3 && gtu_cpu.isHalted())
-    {
-        std::cerr << "--- Debug Mode 3: Final Thread Table State (CPU Halted) ---" << std::endl;
-        dumpThreadTableForDebug3(systemMemory, std::cerr);
-    }
-
-    std::cout << "Total instructions executed (from mem[" << INSTR_COUNT_ADDR << "]): "
-              << systemMemory.read(INSTR_COUNT_ADDR) << std::endl;
-
-    return 0;
-}
-
-// --- Instruction Parsing Implementation ---
-std::vector<Instruction> parseInstructionSection(std::ifstream &fileStream, const std::string &filename, int &lineOffset)
-{
-    std::vector<Instruction> instructions;
-    std::string line;
-    bool inInstructionSection = false;
-    int instructionIndex = 0; // To track instruction index within the section
-
-    while (std::getline(fileStream, line))
-    {
-        lineOffset++;
-        size_t commentPos = line.find('#');
-        if (commentPos != std::string::npos)
-            line = line.substr(0, commentPos);
-        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
-        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
-
-        if (line == "Begin Instruction Section")
-        {
-            inInstructionSection = true;
-            break;
-        }
-    }
-
-    if (!inInstructionSection)
-    {
-        return instructions; // Return empty vector
-    }
-
-    while (std::getline(fileStream, line))
-    {
-        lineOffset++;
-        std::string originalInstLine = line; // Keep original for Instruction struct
-
-        size_t commentPos = line.find('#');
-
-        if (commentPos != std::string::npos)
-        {
-            line = line.substr(0, commentPos);
-        }
-
-        line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
-        line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
-
-        if (line == "End Instruction Section")
-            break;
-        if (line.empty())
-            continue;
-
-        // The first token is "line_number_in_section" which we ignore for parsing the instruction itself,
-        // but it's good for validation or if we were to support labels that resolve to these numbers.
-        // For now, the CPU PC is an index into the vector, so these explicit numbers are mostly for human readability.
-
-        std::istringstream iss(line);
-        int parsedLineNum; // The '0', '1', '2' at the start of instruction lines
-        std::string mnemonic_str;
-
-        if (!(iss >> parsedLineNum))
-        {
-            throw std::runtime_error("Missing instruction line number at file line " + std::to_string(lineOffset) + ". Content: '" + originalInstLine + "'");
-        }
-
-        if (parsedLineNum != instructionIndex)
-        {
-            std::cerr << "Warning: Instruction line number mismatch at file line " << std::to_string(lineOffset)
-                      << ". Expected " << instructionIndex << ", got " << parsedLineNum
-                      << ". Using vector index for PC. Line: '" << originalInstLine << "'" << std::endl;
-        }
-
-        if (!(iss >> mnemonic_str))
-        {
-            throw std::runtime_error("Missing mnemonic at file line " + std::to_string(lineOffset) + ". Content: '" + originalInstLine + "'");
-        }
-        std::transform(mnemonic_str.begin(), mnemonic_str.end(), mnemonic_str.begin(), ::toupper); // To uppercase
-
-        Instruction instr;
-        instr.original_line = originalInstLine; // Store full original line
-        long arg1_val = 0, arg2_val = 0;
-
-        // Temporary string stream for parsing operands for current line
-        std::string operands_part_str;
-
-        std::getline(iss, operands_part_str); // Get " 10, 50" (with leading space)
-
-        // Trim leading space from operands_part_str
-        operands_part_str.erase(0, operands_part_str.find_first_not_of(" \t"));
-        operands_part_str.erase(std::remove(operands_part_str.begin(), operands_part_str.end(), ','), operands_part_str.end());
-
-        std::istringstream ops_iss(operands_part_str);
-
-        if (mnemonic_str == "SYSCALL")
-        {
-            std::string syscallType;
-            if (!(ops_iss >> syscallType))
-                throw std::runtime_error("SYSCALL: Missing type (PRN, HLT, YIELD). File line " + std::to_string(lineOffset) + ": " + originalInstLine);
-            std::transform(syscallType.begin(), syscallType.end(), syscallType.begin(), ::toupper);
-
-            if (syscallType == "PRN")
-            {
-                instr.opcode = OpCode::SYSCALL_PRN;
-                instr.num_operands = 1;
-                if (!(ops_iss >> arg1_val))
-                    throw std::runtime_error("SYSCALL PRN: Missing address argument. File line " + std::to_string(lineOffset) + ": " + originalInstLine);
-                instr.arg1 = arg1_val;
-            }
-            else if (syscallType == "HLT")
-            {
-                instr.opcode = OpCode::SYSCALL_HLT_THREAD;
-                instr.num_operands = 0;
-            }
-            else if (syscallType == "YIELD")
-            {
-                instr.opcode = OpCode::SYSCALL_YIELD;
-                instr.num_operands = 0;
-            }
-            else
-            {
-                throw std::runtime_error("Unknown SYSCALL type: " + syscallType + ". File line " + std::to_string(lineOffset) + ": " + originalInstLine);
+                // Print to std::cerr so it doesn't interfere with the program's SYSCALL PRN output
+                std::cerr << "Cycle " << std::setw(5) << cycle_count
+                          << " | PC: " << std::setw(4) << current_pc_for_debug
+                          << " | Executing: " << instr_to_exec.original_line << std::endl;
             }
         }
         else
         {
-            auto it = MNEMONIC_TO_OPCODE.find(mnemonic_str);
-            if (it == MNEMONIC_TO_OPCODE.end())
-            {
-                throw std::runtime_error("Unknown mnemonic: " + mnemonic_str + ". File line " + std::to_string(lineOffset) + ": " + originalInstLine);
-            }
-            instr.opcode = it->second;
+            std::cerr << "Cycle " << std::setw(5) << cycle_count
+                      << " | PC: " << std::setw(4) << current_pc_for_debug
+                      << " | NOTE: PC is out of instruction bounds. CPU will fault." << std::endl;
+        }  */
 
-            // Determine operands based on opcode
-            switch (instr.opcode)
-            {
-            case OpCode::HLT:
-            case OpCode::RET:
-                instr.num_operands = 0;
-                break;
-            case OpCode::USER: // USER A (arg1=A)
-            case OpCode::PUSH:
-            case OpCode::POP:
-            case OpCode::CALL: // CALL C (arg1=C)
-                instr.num_operands = 1;
-                if (!(ops_iss >> arg1_val))
-                    throw std::runtime_error(mnemonic_str + ": Expects 1 operand. File line " + std::to_string(lineOffset) + ": " + originalInstLine);
-                instr.arg1 = arg1_val;
-                break;
-            case OpCode::SET:  // SET B A (arg1=B, arg2=A)
-            case OpCode::CPY:  // CPY A1 A2
-            case OpCode::CPYI: // CPYI A1 A2
-            case OpCode::CPYI2:
-            case OpCode::ADD:  // ADD A B
-            case OpCode::ADDI: // ADDI A1 A2
-            case OpCode::SUBI: // SUBI A1 A2
-            case OpCode::JIF:  // JIF A C
-                instr.num_operands = 2;
-                if (!(ops_iss >> arg1_val >> arg2_val))
-                    throw std::runtime_error(mnemonic_str + ": Expects 2 operands. File line " + std::to_string(lineOffset) + ": " + originalInstLine);
-                instr.arg1 = arg1_val;
-                instr.arg2 = arg2_val;
-                break;
-            default: // Should not happen if MNEMONIC_TO_OPCODE is complete
-                throw std::runtime_error("Internal parser error: Unhandled opcode " + mnemonic_str + " in switch. File line " + std::to_string(lineOffset));
-            }
-        }
+        gtu_cpu.step();
+        cycle_count++;
 
-        std::string junk;
-        if (ops_iss >> junk && !junk.empty())
+        bool current_is_user_mode = gtu_cpu.isInUserMode();
+        CpuEvent current_event_code = static_cast<CpuEvent>(systemMemory.read(CPU_OS_COMM_ADDR));
+
+        if (args.debug_mode == 3)
         {
-            size_t junk_comment_pos = junk.find('#');
-            if (junk_comment_pos == 0 || (junk_comment_pos == std::string::npos && !junk.empty()))
-                throw std::runtime_error(mnemonic_str + ": Too many operands or trailing characters. File line " + std::to_string(lineOffset) + ": '" + originalInstLine + "'. Junk: '" + junk + "'");
+            bool syscall_like_event_occurred = (current_event_code != CpuEvent::NONE);
+            bool context_switch_to_user = !prev_is_user_mode && current_is_user_mode;
+            bool syscall_trap_to_kernel = prev_is_user_mode && !current_is_user_mode && syscall_like_event_occurred;
+            
+            // For debug mode 3, we should trigger on any syscall or context switch
+            // This includes: any non-NONE event, or mode transitions
+            bool should_dump_thread_table = context_switch_to_user || syscall_trap_to_kernel || syscall_like_event_occurred;
+
+            if (should_dump_thread_table)
+            {
+                std::cerr << "--- D3: Event Trigger (Cycle " << cycle_count << ") ---" << std::endl;
+                if (context_switch_to_user)
+                    std::cerr << "Context switch to USER detected." << std::endl;
+                if (syscall_trap_to_kernel)
+                    std::cerr << "Syscall/Trap to KERNEL detected. Event: " << static_cast<long>(current_event_code) << std::endl;
+                if (syscall_like_event_occurred && !syscall_trap_to_kernel)
+                    std::cerr << "System call event detected. Event: " << static_cast<long>(current_event_code) << std::endl;
+                    
+                dumpThreadTableForDebug3(systemMemory, std::cerr);
+                
+                // DEBUG MODE SHOULD ONLY OBSERVE, NOT MODIFY SYSTEM STATE
+                // The OS itself will clear events when appropriate - we don't interfere
+                std::cerr << "Event preserved for OS handling (not cleared by debug mode)." << std::endl;
+                
+                // Optional pause for mode 3 event
+                std::cerr << "--- Press ENTER to continue after D3 event ---" << std::endl;
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            }
         }
 
-        instructions.push_back(instr);
-        instructionIndex++;
+        // Dumps for -D1, -D2 happen after step
+        if (args.debug_mode == 1)
+        {
+            dumpMemoryForDebug(systemMemory, args.debug_mode);
+        }
+        else if (args.debug_mode == 2)
+        {
+            dumpMemoryForDebug(systemMemory, args.debug_mode); // This includes its own "Press ENTER"
+            // No need for "Cycle ... completed" here as dumpMemoryForDebug handles the pause
+        }
+        prev_is_user_mode = current_is_user_mode;
+        if (current_event_code != CpuEvent::NONE && !gtu_cpu.isInUserMode())
+        { // Clear event if OS is handling it
+            // This assumes OS will handle it in its current timeslice.
+            // Or OS can clear it by writing 0 to CPU_OS_COMM_ADDR
+            // memory.write(CPU_OS_COMM_ADDR, static_cast<long>(CpuEvent::NONE)); // CPU might do this or OS does
+        }
     }
 
-    // Check if "End Instruction Section" was found
-    if (inInstructionSection && line != "End Instruction Section" && !fileStream.eof())
+    if (gtu_cpu.isHalted())
     {
-        if (fileStream.eof())
-        {
-            throw std::runtime_error("'End Instruction Section' marker not found before EOF in " + filename + " (last relevant file line: " + std::to_string(lineOffset) + ")");
-        }
+        std::cout << "Program HLT instruction executed after " << cycle_count << " cycles." << std::endl;
     }
-    return instructions;
+    else if (cycle_count >= MAX_CYCLES)
+    {
+        std::cerr << "Program terminated: Maximum cycle limit reached (" << MAX_CYCLES << ")." << std::endl;
+    }
+    else
+    {
+        std::cout << "Program ended for unknown reason after " << cycle_count << " cycles." << std::endl;
+    }
+
+    // Final dump for mode 0 (or always if desired)
+    if (args.debug_mode == 0 || args.debug_mode == -1)
+    {                                              // -1 was if not set, now defaults to 0
+        dumpMemoryForDebug(systemMemory, 0, true); // Mode 0 dump after halt
+    }
+    else if (gtu_cpu.isHalted())
+    { // If halted and was in D1, D2, D3, still good to see final state
+        std::cerr << "--- Final Memory State After Halt ---" << std::endl;
+        systemMemory.dumpImportantRegions(std::cerr);
+    }
+
+    return 0;
 }

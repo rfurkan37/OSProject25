@@ -1,411 +1,437 @@
-// tools/gtu_assembler.cpp
+// tools/gtu_assembler.cpp (ENHANCED WITH MEMORY LABELS)
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <sstream>
-#include <algorithm> // For std::transform, std::remove
-#include <iomanip>   // For std::setw (optional for cleaner output)
+#include <algorithm>
+#include <iomanip>
 #include <unordered_map>
 
-// Bring in OpCode definition if we want to be super strict,
-// or just use string comparisons for mnemonics.
-// For simplicity here, we'll use string comparisons but map to expected arg counts.
-// If you include ../src/instruction.h, ensure your build system can find it.
-// #include "../src/instruction.h" // Might need to adjust include path
-
-// Define mnemonic properties (name, expected operand count)
 struct MnemonicInfo
 {
     std::string name;
     int operand_count;
-    // OpCode opcode_val; // Optional: if mapping to enum
 };
 
 const std::unordered_map<std::string, MnemonicInfo> MNEMONIC_TABLE = {
-    {"SET", {"SET", 2}},
-    {"CPY", {"CPY", 2}},
-    {"CPYI", {"CPYI", 2}},
-    {"CPYI2", {"CPYI2", 2}}, // Optional
-    {"ADD", {"ADD", 2}},
-    {"ADDI", {"ADDI", 2}},
-    {"SUBI", {"SUBI", 2}},
-    {"JIF", {"JIF", 2}},
-    {"PUSH", {"PUSH", 1}},
-    {"POP", {"POP", 1}},
-    {"CALL", {"CALL", 1}},
-    {"RET", {"RET", 0}},
-    {"HLT", {"HLT", 0}},
-    {"USER", {"USER", 1}} // USER A (takes one address operand)
-    // SYSCALL is special
+    {"SET", {"SET", 2}}, {"CPY", {"CPY", 2}}, {"CPYI", {"CPYI", 2}}, 
+    {"CPYI2", {"CPYI2", 2}}, {"ADD", {"ADD", 2}}, {"ADDI", {"ADDI", 2}}, 
+    {"SUBI", {"SUBI", 2}}, {"JIF", {"JIF", 2}}, {"PUSH", {"PUSH", 1}}, 
+    {"POP", {"POP", 1}}, {"CALL", {"CALL", 1}}, {"RET", {"RET", 0}}, 
+    {"HLT", {"HLT", 0}}, {"USER", {"USER", 1}}, {"STOREI", {"STOREI", 2}},
+    {"LOADI", {"LOADI", 2}}
 };
 
 const std::unordered_map<std::string, MnemonicInfo> SYSCALL_SUBTYPE_TABLE = {
-    {"PRN", {"SYSCALL PRN", 1}},
-    {"HLT", {"SYSCALL HLT", 0}}, // Thread HLT
-    {"YIELD", {"SYSCALL YIELD", 0}}};
+    {"PRN", {"SYSCALL PRN", 1}}, {"HLT", {"SYSCALL HLT", 0}}, {"YIELD", {"SYSCALL YIELD", 0}}
+};
 
-// Helper to trim whitespace and comments
-std::string trim_and_remove_comments(const std::string &s)
-{
+std::unordered_map<std::string, long> symbolic_constants;
+std::unordered_map<std::string, long> memory_labels; // NEW: For memory address labels
+
+std::string trim_and_remove_comments(const std::string &s) {
     std::string result = s;
     size_t comment_pos = result.find('#');
-    if (comment_pos != std::string::npos)
-    {
+    if (comment_pos != std::string::npos) {
         result = result.substr(0, comment_pos);
     }
-    // Trim leading whitespace
     result.erase(0, result.find_first_not_of(" \t\n\r\f\v"));
-    // Trim trailing whitespace
     result.erase(result.find_last_not_of(" \t\n\r\f\v") + 1);
     return result;
 }
 
-// Helper to split string by delimiter, handles multiple spaces
-std::vector<std::string> split_string(const std::string &s, char delimiter = ' ')
-{
+std::vector<std::string> split_string(const std::string &s, char /* delimiter */ = ' ') {
     std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(s);
-    while (std::getline(tokenStream, token, delimiter))
-    {
-        // Handle multiple spaces by further check or istringstream property
-        // The default istringstream >> token behavior handles multiple spaces well.
-        // If using getline, need to filter empty tokens if multiple delimiters are together.
-        // For simple space split, istringstream >> is easier:
-    }
-
-    // Reset stream for token extraction
-    tokenStream.clear();
-    tokenStream.str(s);
     std::string temp_token;
-    while (tokenStream >> temp_token)
-    {
+    std::istringstream tokenStream(s);
+    while (tokenStream >> temp_token) {
         tokens.push_back(temp_token);
     }
     return tokens;
 }
 
-bool is_number(const std::string &s)
-{
-    if (s.empty())
-        return false;
+bool is_number(const std::string &s) {
+    if (s.empty()) return false;
     char *end = nullptr;
-    std::strtol(s.c_str(), &end, 10); // Use strtol for robust checking
-    // Check if the entire string was consumed and it's not just a '-' or '+'
+    std::strtol(s.c_str(), &end, 10);
     return (*end == '\0' && !s.empty() && (s.length() > 1 || std::isdigit(s[0])));
+}
+
+bool is_valid_symbol(const std::string &s) {
+    if (s.empty()) return false;
+    if (!std::isalpha(s[0]) && s[0] != '_') return false;
+    for (size_t i = 1; i < s.length(); ++i) {
+        if (!std::isalnum(s[i]) && s[i] != '_') return false;
+    }
+    return true;
+}
+
+std::string resolve_token(const std::string &token, int line_number) {
+    if (is_number(token)) return token;
+    
+    // First check memory labels
+    auto mem_it = memory_labels.find(token);
+    if (mem_it != memory_labels.end()) return std::to_string(mem_it->second);
+    
+    // Then check symbolic constants
+    auto it = symbolic_constants.find(token);
+    if (it != symbolic_constants.end()) return std::to_string(it->second);
+    
+    std::cerr << "Error L" << line_number << ": Undefined symbol '" << token << "'" << std::endl;
+    return token;
+}
+
+// NEW: Function to export symbols to header file
+void export_symbols_to_header(const std::string& header_filename) {
+    std::ofstream header_file(header_filename);
+    if (!header_file.is_open()) {
+        std::cerr << "Warning: Could not create symbols header file '" << header_filename << "'" << std::endl;
+        return;
+    }
+    
+    header_file << "// Auto-generated by GTU Assembler - DO NOT EDIT MANUALLY\n";
+    header_file << "#ifndef ASSEMBLED_SYMBOLS_H\n";
+    header_file << "#define ASSEMBLED_SYMBOLS_H\n\n";
+    
+    // Export memory address labels
+    header_file << "// Memory Address Labels\n";
+    for (const auto& pair : memory_labels) {
+        header_file << "#define " << pair.first << " " << pair.second << "\n";
+    }
+    
+    header_file << "\n// Exported symbol addresses from assembly\n";
+    
+    // Export key OS symbols that the CPU needs to know about
+    std::vector<std::string> important_symbols = {
+        "OS_SYSCALL_DISPATCHER",
+        "OS_MEMORY_FAULT_HANDLER_PC", 
+        "OS_ARITHMETIC_FAULT_HANDLER_PC",
+        "OS_UNKNOWN_INSTRUCTION_HANDLER_PC",
+        "THREAD_1_START",
+        "THREAD_2_START", 
+        "THREAD_3_START"
+    };
+    
+    for (const std::string& symbol : important_symbols) {
+        auto it = symbolic_constants.find(symbol);
+        if (it != symbolic_constants.end()) {
+            header_file << "#define " << symbol << " " << it->second << "\n";
+        }
+    }
+    
+    header_file << "\n// All exported symbols\n";
+    for (const auto& pair : symbolic_constants) {
+        if (std::find(important_symbols.begin(), important_symbols.end(), pair.first) == important_symbols.end()) {
+            header_file << "#define SYMBOL_" << pair.first << " " << pair.second << "\n";
+        }
+    }
+    
+    header_file << "\n#endif // ASSEMBLED_SYMBOLS_H\n";
+    header_file.close();
+    
+    std::cout << "Exported " << memory_labels.size() << " memory labels and " 
+              << symbolic_constants.size() << " symbols to " << header_filename << std::endl;
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2 || argc > 3)
-    {
-        std::cerr << "Usage: ./gtu_assembler <input_file.g312> [output_file.img]" << std::endl;
+    if (argc < 2 || argc > 4) {
+        std::cerr << "Usage: ./gtu_assembler <input_file.g312> [output_file.img] [symbols_header.h]" << std::endl;
+        std::cerr << "Enhanced with memory address labels: label_name@address value" << std::endl;
         return 1;
     }
 
     std::string input_filename = argv[1];
     std::string output_filename;
+    std::string symbols_header_filename;
 
-    if (argc == 3)
-    {
+    if (argc >= 3) {
         output_filename = argv[2];
-    }
-    else
-    {
+    } else {
         size_t dot_pos = input_filename.rfind(".g312");
-        if (dot_pos != std::string::npos)
-        {
+        if (dot_pos != std::string::npos) {
             output_filename = input_filename.substr(0, dot_pos) + ".img";
-        }
-        else
-        {
+        } else {
             output_filename = input_filename + ".img";
+        }
+    }
+    
+    if (argc >= 4) {
+        symbols_header_filename = argv[3];
+    } else {
+        size_t dot_pos = input_filename.rfind(".g312");
+        if (dot_pos != std::string::npos) {
+            symbols_header_filename = input_filename.substr(0, dot_pos) + "_symbols.h";
+        } else {
+            symbols_header_filename = input_filename + "_symbols.h";
         }
     }
 
     std::ifstream infile(input_filename);
-    if (!infile.is_open())
-    {
+    if (!infile.is_open()) {
         std::cerr << "Error: Could not open input file '" << input_filename << "'." << std::endl;
         return 1;
     }
 
+    std::vector<std::string> all_lines;
+    std::vector<int> line_numbers;
+    std::string line;
+    int line_number = 0;
+    while (std::getline(infile, line)) {
+        line_number++;
+        all_lines.push_back(line);
+        line_numbers.push_back(line_number);
+    }
+    infile.close();
+
+    // =========================================================================
+    // =========== PASS 1 (ENHANCED FOR MEMORY LABELS) ========================
+    // =========================================================================
+    enum class Section { NONE, DATA, INSTRUCTION };
+    Section current_section = Section::NONE;
+    int temp_instruction_counter = 0;
+    
+    for (size_t i = 0; i < all_lines.size(); ++i) {
+        std::string processed_line_content = trim_and_remove_comments(all_lines[i]);
+        if (processed_line_content.empty()) continue;
+
+        std::string temp_line_upper = processed_line_content;
+        std::transform(temp_line_upper.begin(), temp_line_upper.end(), temp_line_upper.begin(), ::toupper);
+
+        if (temp_line_upper == "BEGIN DATA SECTION") {
+            current_section = Section::DATA;
+            continue;
+        } else if (temp_line_upper == "END DATA SECTION") {
+            current_section = Section::NONE;
+            continue;
+        } else if (temp_line_upper == "BEGIN INSTRUCTION SECTION") {
+            current_section = Section::INSTRUCTION;
+            temp_instruction_counter = 0;
+            continue;
+        } else if (temp_line_upper == "END INSTRUCTION SECTION") {
+            current_section = Section::NONE;
+            continue;
+        }
+
+        if (current_section == Section::DATA) {
+            std::vector<std::string> tokens = split_string(processed_line_content);
+            
+            // NEW: Handle memory address labels (label@address value)
+            if (tokens.size() >= 2) {
+                std::string first_token = tokens[0];
+                size_t at_pos = first_token.find('@');
+                
+                if (at_pos != std::string::npos) {
+                    // This is a memory label: label_name@address
+                    std::string label_name = first_token.substr(0, at_pos);
+                    std::string address_str = first_token.substr(at_pos + 1);
+                    
+                    if (is_valid_symbol(label_name) && is_number(address_str)) {
+                        long address = std::stol(address_str);
+                        memory_labels[label_name] = address;
+                        std::cout << "Memory label: " << label_name << " @ " << address << std::endl;
+                    }
+                } else if (tokens.size() == 2 && is_valid_symbol(tokens[0]) && is_number(tokens[1])) {
+                    // Regular symbolic constant
+                    symbolic_constants[tokens[0]] = std::stol(tokens[1]);
+                }
+            }
+        } else if (current_section == Section::INSTRUCTION) {
+            std::vector<std::string> tokens = split_string(processed_line_content);
+            if (tokens.empty()) continue;
+
+            // Is this a label definition? (e.g., "MY_LABEL:")
+            if (tokens.size() == 1 && tokens[0].back() == ':') {
+                std::string label_name = tokens[0].substr(0, tokens[0].length() - 1);
+                symbolic_constants[label_name] = temp_instruction_counter;
+                continue; // This line itself is not an instruction, so don't count it.
+            }
+
+            // It's not a label, so it must be an instruction line.
+            std::string instruction_part_str = processed_line_content;
+            if (is_number(tokens[0])) {
+                instruction_part_str = instruction_part_str.substr(instruction_part_str.find_first_of(" \t") + 1);
+            }
+
+            std::stringstream ss(instruction_part_str);
+            std::string part;
+            while (std::getline(ss, part, ';')) {
+                part = trim_and_remove_comments(part);
+                if (!part.empty()) {
+                    temp_instruction_counter++;
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // =========== PASS 2 (ENHANCED FOR MEMORY LABELS) ========================
+    // =========================================================================
     std::ofstream outfile(output_filename);
-    if (!outfile.is_open())
-    {
+    if (!outfile.is_open()) {
         std::cerr << "Error: Could not open output file '" << output_filename << "'." << std::endl;
-        infile.close();
         return 1;
     }
 
-    std::string line;
-    int line_number = 0;
-    enum class Section
-    {
-        NONE,
-        DATA,
-        INSTRUCTION
-    };
-    Section current_section = Section::NONE;
-    int instruction_pc_counter = 0; // For validating instruction line numbers
+    current_section = Section::NONE;
+    int instruction_pc_counter = 0;
+    std::vector<std::string> processed_lines;
 
-    std::vector<std::string> processed_lines; // To store validated lines before writing
-
-    while (std::getline(infile, line))
-    {
-        line_number++;
-        std::string original_line = line; // For error messages
+    for (size_t i = 0; i < all_lines.size(); ++i) {
+        line_number = line_numbers[i];
+        std::string line = all_lines[i];
         std::string processed_line_content = trim_and_remove_comments(line);
 
-        if (processed_line_content.empty())
-        {
-            // outfile << line << std::endl; // Preserve empty lines/comments if desired
-            processed_lines.push_back(line); // Preserve full original line for comments/spacing
+        if (processed_line_content.empty()) {
+            processed_lines.push_back(line);
             continue;
         }
 
         std::string temp_line_upper = processed_line_content;
         std::transform(temp_line_upper.begin(), temp_line_upper.end(), temp_line_upper.begin(), ::toupper);
 
-        if (temp_line_upper == "BEGIN DATA SECTION")
-        {
-            if (current_section != Section::NONE)
-            {
-                std::cerr << "Error L" << line_number << ": Unexpected 'Begin Data Section'. Current section: "
-                          << static_cast<int>(current_section) << std::endl;
-                return 1;
-            }
+        if (temp_line_upper == "BEGIN DATA SECTION") {
             current_section = Section::DATA;
             processed_lines.push_back(processed_line_content);
             continue;
-        }
-        else if (temp_line_upper == "END DATA SECTION")
-        {
-            if (current_section != Section::DATA)
-            {
-                std::cerr << "Error L" << line_number << ": 'End Data Section' without matching 'Begin'." << std::endl;
-                return 1;
-            }
+        } else if (temp_line_upper == "END DATA SECTION") {
             current_section = Section::NONE;
             processed_lines.push_back(processed_line_content);
             continue;
-        }
-        else if (temp_line_upper == "BEGIN INSTRUCTION SECTION")
-        {
-            if (current_section != Section::NONE)
-            {
-                std::cerr << "Error L" << line_number << ": Unexpected 'Begin Instruction Section'." << std::endl;
-                return 1;
-            }
+        } else if (temp_line_upper == "BEGIN INSTRUCTION SECTION") {
             current_section = Section::INSTRUCTION;
-            instruction_pc_counter = 0; // Reset for new instruction section
+            instruction_pc_counter = 0;
             processed_lines.push_back(processed_line_content);
             continue;
-        }
-        else if (temp_line_upper == "END INSTRUCTION SECTION")
-        {
-            if (current_section != Section::INSTRUCTION)
-            {
-                std::cerr << "Error L" << line_number << ": 'End Instruction Section' without matching 'Begin'." << std::endl;
-                return 1;
-            }
+        } else if (temp_line_upper == "END INSTRUCTION SECTION") {
             current_section = Section::NONE;
             processed_lines.push_back(processed_line_content);
             continue;
         }
 
-        if (current_section == Section::NONE)
-        {
+        if (current_section == Section::NONE) {
             std::cerr << "Error L" << line_number << ": Content '" << processed_line_content << "' outside of any section." << std::endl;
             return 1;
         }
 
-        // --- Process lines within sections ---
-        if (current_section == Section::DATA)
-        {
+        if (current_section == Section::DATA) {
             std::vector<std::string> tokens = split_string(processed_line_content);
-            if (tokens.size() != 2)
-            {
-                std::cerr << "Error L" << line_number << " (Data): Invalid format. Expected 'address value'. Got: '"
-                          << processed_line_content << "'" << std::endl;
+            if (tokens.size() < 2) {
+                std::cerr << "Error L" << line_number << " (Data): Invalid format. Expected 'address value' or 'symbol value' or 'label@address value'." << std::endl;
                 return 1;
             }
-            if (!is_number(tokens[0]) || !is_number(tokens[1]))
-            {
-                std::cerr << "Error L" << line_number << " (Data): Address and value must be integers. Got: '"
-                          << processed_line_content << "'" << std::endl;
+            
+            std::string first_token = tokens[0];
+            size_t at_pos = first_token.find('@');
+            
+            if (at_pos != std::string::npos) {
+                // Memory label format: label@address value
+                std::string label_name = first_token.substr(0, at_pos);
+                std::string address_str = first_token.substr(at_pos + 1);
+                
+                if (is_valid_symbol(label_name) && is_number(address_str)) {
+                    std::string resolved_value = resolve_token(tokens[1], line_number);
+                    if (!is_number(resolved_value)) return 1;
+                    processed_lines.push_back(address_str + " " + resolved_value);
+                } else {
+                    std::cerr << "Error L" << line_number << " (Data): Invalid memory label format." << std::endl;
+                    return 1;
+                }
+            } else if (is_valid_symbol(tokens[0]) && is_number(tokens[1])) {
+                continue; // Skip symbolic constant definition
+            } else if (is_number(tokens[0])) {
+                std::string resolved_value = resolve_token(tokens[1], line_number);
+                if (!is_number(resolved_value)) return 1;
+                processed_lines.push_back(tokens[0] + " " + resolved_value); 
+            } else {
+                std::cerr << "Error L" << line_number << " (Data): Invalid format." << std::endl;
                 return 1;
             }
-            // Valid data line
-            processed_lines.push_back(tokens[0] + " " + tokens[1]); // Reconstruct for consistent spacing
-        }
-        else if (current_section == Section::INSTRUCTION)
-        {
+        } else if (current_section == Section::INSTRUCTION) {
             std::vector<std::string> tokens = split_string(processed_line_content);
-            if (tokens.empty())
-            { // Should have been caught by processed_line_content.empty()
-                continue;
+            if (tokens.empty()) continue;
+            if (tokens.size() == 1 && tokens[0].back() == ':') continue;
+
+            bool is_numbered_format = is_number(tokens[0]);
+            std::string instruction_part;
+
+            if (is_numbered_format) {
+                for (size_t i = 1; i < tokens.size(); ++i) {
+                    if (i > 1) instruction_part += " ";
+                    instruction_part += tokens[i];
+                }
+            } else {
+                instruction_part = processed_line_content;
             }
 
-            // Validate instruction line number
-            if (!is_number(tokens[0]))
-            {
-                std::cerr << "Error L" << line_number << " (Instruction): Expected line index as first token. Got: '"
-                          << tokens[0] << "'" << std::endl;
-                return 1;
-            }
-            long instr_idx = std::stol(tokens[0]);
-            if (instr_idx != instruction_pc_counter)
-            {
-                // This is a warning for now, as the simulator uses vector index.
-                // But could be an error if strict sequential numbering is required by spec for the .img file.
-                // The example shows "6 SET 2 0" then "7 HLT", so seems sequential.
-                std::cerr << "Warning L" << line_number << " (Instruction): Line index '" << instr_idx
-                          << "' does not match expected sequential PC '" << instruction_pc_counter << "'." << std::endl;
+            std::vector<std::string> semicolon_parts;
+            std::stringstream ss(instruction_part);
+            std::string part;
+            while (std::getline(ss, part, ';')) {
+                part = trim_and_remove_comments(part);
+                if (!part.empty()) semicolon_parts.push_back(part);
             }
 
-            if (tokens.size() < 2)
-            { // Must have at least line_idx and mnemonic
-                std::cerr << "Error L" << line_number << " (Instruction): Incomplete instruction. Missing mnemonic. Got: '"
-                          << processed_line_content << "'" << std::endl;
-                return 1;
-            }
+            for (const auto& current_instruction : semicolon_parts) {
+                std::vector<std::string> instr_tokens = split_string(current_instruction);
+                if (instr_tokens.empty()) continue;
 
-            std::string mnemonic = tokens[1];
-            std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(), ::toupper);
+                std::string mnemonic = instr_tokens[0];
+                std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(), ::toupper);
 
-            std::vector<std::string> args;
-            int expected_args = -1;
-            std::string full_mnemonic_for_error = mnemonic;
+                std::vector<std::string> args;
+                int expected_args = -1;
+                std::string full_mnemonic_for_error = mnemonic;
 
-            if (mnemonic == "SYSCALL")
-            {
-                if (tokens.size() < 3)
-                {
-                    std::cerr << "Error L" << line_number << " (Instruction): SYSCALL missing subtype (PRN, HLT, YIELD). Got: '"
-                              << processed_line_content << "'" << std::endl;
-                    return 1;
-                }
-                std::string subtype = tokens[2];
-                std::transform(subtype.begin(), subtype.end(), subtype.begin(), ::toupper);
-                full_mnemonic_for_error += " " + subtype;
-
-                auto it = SYSCALL_SUBTYPE_TABLE.find(subtype);
-                if (it == SYSCALL_SUBTYPE_TABLE.end())
-                {
-                    std::cerr << "Error L" << line_number << " (Instruction): Unknown SYSCALL subtype '" << subtype << "'. Got: '"
-                              << processed_line_content << "'" << std::endl;
-                    return 1;
-                }
-                expected_args = it->second.operand_count;
-                for (size_t i = 3; i < tokens.size(); ++i)
-                { // Args start after PC, MNEMONIC, SUBTYPE
-                    args.push_back(tokens[i]);
-                }
-            }
-            else
-            {
-                auto it = MNEMONIC_TABLE.find(mnemonic);
-                if (it == MNEMONIC_TABLE.end())
-                {
-                    std::cerr << "Error L" << line_number << " (Instruction): Unknown mnemonic '" << mnemonic << "'. Got: '"
-                              << processed_line_content << "'" << std::endl;
-                    return 1;
-                }
-                expected_args = it->second.operand_count;
-                for (size_t i = 2; i < tokens.size(); ++i)
-                { // Args start after PC, MNEMONIC
-                    // Handle comma: if "val1," it's one token. if "val1 ," it's two.
-                    // Simplest for now: assume args are separated by spaces primarily.
-                    // The spec shows "SET -20, 100". This means "val," is one token or we need to parse better.
-                    // Let's assume "split_string" gives "val1," and "val2" or "val1" and "val2"
-                    // For "SET B, A", tokens might be ["idx", "SET", "B,", "A"] or ["idx", "SET", "B", ",", "A"]
-                    // The current split_string is basic. For robustness:
-                    // std::string arg_token_raw = tokens[i];
-                    // if (arg_token_raw.back() == ',') arg_token_raw.pop_back();
-                    // if (!arg_token_raw.empty()) args.push_back(arg_token_raw);
-                    // This doesn't handle "B , A". For now, assume "B,A" or "B A".
-
-                    // Let's refine argument collection to handle one optional comma for 2-arg instructions.
-                    // The first arg token is tokens[2].
-                    // If expected_args == 2:
-                    //   token[2] is arg1. It might have a comma: "val1,".
-                    //   token[3] is arg2.
-                    // If tokens[2] is "val1," and tokens[3] is "val2", it's fine.
-                    // If tokens[2] is "val1" and tokens[3] is "," and tokens[4] is "val2" -> needs better splitter or parser.
-                    // Current split_string will give ["idx", "SET", "B,", "A"] for "idx SET B, A"
-                    // And ["idx", "SET", "B", "A"] for "idx SET B A"
-                    // And ["idx", "SET", "B", ",", "A"] for "idx SET B , A" -> problem for current loop.
-
-                    // Let's reconstruct args more carefully for validation:
-                    // After mnemonic (tokens[1]), all subsequent tokens are potential args or commas.
-                }
-                // Rebuild args vector from tokens[2] onwards, stripping commas from ends of tokens
-                // And skipping standalone comma tokens.
-                for (size_t i = 2; i < tokens.size(); ++i)
-                {
-                    std::string current_arg_token = tokens[i];
-                    if (current_arg_token == ",")
-                        continue; // Skip standalone comma
-                    if (!current_arg_token.empty() && current_arg_token.back() == ',')
-                    {
-                        current_arg_token.pop_back();
-                    }
-                    if (!current_arg_token.empty())
-                    { // Ensure not an empty string after stripping comma
-                        args.push_back(current_arg_token);
+                if (mnemonic == "SYSCALL") {
+                    if (instr_tokens.size() < 2) { std::cerr << "Error L" << line_number << ": SYSCALL missing subtype" << std::endl; return 1; }
+                    std::string subtype = instr_tokens[1];
+                    std::transform(subtype.begin(), subtype.end(), subtype.begin(), ::toupper);
+                    full_mnemonic_for_error += " " + subtype;
+                    auto it = SYSCALL_SUBTYPE_TABLE.find(subtype);
+                    if (it == SYSCALL_SUBTYPE_TABLE.end()) { std::cerr << "Error L" << line_number << ": Unknown SYSCALL subtype '" << subtype << "'" << std::endl; return 1; }
+                    expected_args = it->second.operand_count;
+                    for (size_t i = 2; i < instr_tokens.size(); ++i) args.push_back(instr_tokens[i]);
+                } else {
+                    auto it = MNEMONIC_TABLE.find(mnemonic);
+                    if (it == MNEMONIC_TABLE.end()) { std::cerr << "Error L" << line_number << ": Unknown mnemonic '" << mnemonic << "'" << std::endl; return 1; }
+                    expected_args = it->second.operand_count;
+                    for (size_t i = 1; i < instr_tokens.size(); ++i) {
+                        std::string current_arg_token = instr_tokens[i];
+                        if (current_arg_token == ",") continue;
+                        if (!current_arg_token.empty() && current_arg_token.back() == ',') current_arg_token.pop_back();
+                        if (!current_arg_token.empty()) args.push_back(current_arg_token);
                     }
                 }
-            }
 
-            if (static_cast<int>(args.size()) != expected_args)
-            {
-                std::cerr << "Error L" << line_number << " (Instruction): Mnemonic '" << full_mnemonic_for_error
-                          << "' expects " << expected_args << " arguments, got " << args.size()
-                          << " in '" << processed_line_content << "'" << std::endl;
-                return 1;
-            }
+                if (static_cast<int>(args.size()) != expected_args) { std::cerr << "Error L" << line_number << ": Mnemonic '" << full_mnemonic_for_error << "' expects " << expected_args << " args, got " << args.size() << std::endl; return 1; }
 
-            for (const auto &arg : args)
-            {
-                if (!is_number(arg))
-                {
-                    std::cerr << "Error L" << line_number << " (Instruction): Argument '" << arg << "' for '"
-                              << full_mnemonic_for_error << "' must be an integer. Line: '"
-                              << processed_line_content << "'" << std::endl;
-                    return 1;
+                std::vector<std::string> resolved_args;
+                for (const auto &arg : args) {
+                    std::string resolved = resolve_token(arg, line_number);
+                    if (!is_number(resolved)) return 1;
+                    resolved_args.push_back(resolved);
                 }
-            }
 
-            // Valid instruction line. Reconstruct it for output for consistent format.
-            std::string validated_instr_line = tokens[0] + " " + mnemonic;
-            if (mnemonic == "SYSCALL")
-            {
-                validated_instr_line += " " + tokens[2]; // Subtype
+                std::string validated_instr_line = std::to_string(instruction_pc_counter) + " " + mnemonic;
+                if (mnemonic == "SYSCALL") validated_instr_line += " " + instr_tokens[1];
+                for (const auto& r_arg : resolved_args) validated_instr_line += " " + r_arg;
+                
+                processed_lines.push_back(validated_instr_line);
+                instruction_pc_counter++;
             }
-            for (size_t i = 0; i < args.size(); ++i)
-            {
-                validated_instr_line += " " + args[i];
-                // Optional: Add comma back if it was "SET B, A" style.
-                // For simplicity, output space separated. The parser in sim.cpp will handle both.
-                // If strict output comma needed:
-                // if (expected_args == 2 && i == 0) validated_instr_line += ",";
-            }
-            processed_lines.push_back(validated_instr_line);
-            instruction_pc_counter++;
         }
     }
 
-    // After parsing all lines, write the processed (and original comment/empty) lines
-    for (const auto &p_line : processed_lines)
-    {
+    for (const auto &p_line : processed_lines) {
         outfile << p_line << std::endl;
     }
-
-    std::cout << "Assembly validation successful: '" << input_filename << "' -> '" << output_filename << "'" << std::endl;
-
-    infile.close();
     outfile.close();
+
+    // Export symbols to header file
+    export_symbols_to_header(symbols_header_filename);
+
+    std::cout << "Assembly successful: '" << input_filename << "' -> '" << output_filename << "'" << std::endl;
     return 0;
 }

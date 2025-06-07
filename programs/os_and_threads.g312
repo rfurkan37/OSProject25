@@ -1,0 +1,582 @@
+# ==============================================================================
+# GTU-C312 OPERATING SYSTEM WITH MULTITHREADING SUPPORT (WITH MEMORY LABELS)
+# ==============================================================================
+# .g312 file for the GTU-C312 CPU simulator
+# | Instruction                           | Explanation                                                                                                                                                                                                                                                                            |
+# | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+# | SET B A                           | Direct Set : Set the Ath memory location with number B. mem[A] = B Example: SET -20 100 -> mem[100] = -20                                                                                                                                                |
+# | CPY A1 A2                         | Direct Copy: Copy the content of memory location A1 to memory A2. mem[A2] = mem[A1] Example: CPY 100 120 ->  mem[120] = mem[100]                                                                                                               |
+# | CPYI A1 A2                        | Indirect Copy: Copy the memory address indexed by A1 to memory address A2. mem[A2] = mem[mem[A1]] Example: CPYI 100 120 -> mem[120] = mem[mem[100]]                                  |
+# | CPYI2 A1 A2                       | Indirect Copy 2: Copy the memory address indexed by A1 to memory address indexed by A2. mem[mem[A2]] = mem[mem[A1]] Example:CPYI2 100, 120 -> mem[mem[120]] = mem[mem[100]] |
+# | ADD A B                          | Add number B to memory location A    mem[A] = mem[A] + B                                                                                                                                                                                                                                                  |
+# | ADDI A1 A2                        | Indirect Add: Add the contents of memory address A2 to address A1.   mem[A1] = mem[A1] + mem[A2]                                                                                                                                                                                                                  |
+# | SUBI A1 A2                        | Indirect Subtraction: Subtract the contents of memory address A2 from address A1, put the result in A2   mem[A2] = mem[A1] - mem[A2]                                                                                                                                                                       |
+# | JIF A C                           | Set the CPU program counter with C if memory location A content is less than or equal to 0        if A <= 0 Jump to C                                                                                                                                                                              |
+# | PUSH A                            | Push memory A onto the stack. Stack grows downwards.                                                                                                                                                                                                                                   |
+# | POP A                             | Pop value from stack into memory A.                                                                                                                                                                                                                                                    |
+# | CALL C                                | Call subroutine at instruction C, push return address.                                                                                                                                                                                                                                 |
+# | RET                                   | Return from subroutine at instruction                                                                                                                                                                                                                                                  |
+# | HLT                               | Halts the CPU                                                                                                                                                                                                                                                                          |
+# | SYSCALL PRN A                     | Calls the operating system service. This system call prints the contents of >memory address A to the console followed by a new line character. This<br><br>system call will block the calling thread for 100 instruction executions.                                             |
+# | SYSCALL HLT                      | Calls the operating system service. Shuts down the thread.                                                                                                                                                                                                                             |
+# | SYSCALL YIELD                         | Calls the operating system service. Yields the CPU so OS can schedule other threads.                                                                                                                                                                                                   |
+# | USER A                                | Switch to user mode and jump to address contained at location Ard.                                                                                                                                                                                                                     |
+# | LOADI Ptr_Addr Dest_Addr: mem[Dest_Addr] = mem[mem[Ptr_Addr]] (Loads a value from an address pointed to by Ptr_Addr).
+# | STOREI Src_Addr Ptr_Addr: mem[mem[Ptr_Addr]] = mem[Src_Addr] (Stores a value from Src_Addr to an address pointed to by Ptr_Addr).                    
+
+
+# ==============================================================================
+# DATA SECTION - MEMORY LAYOUT AND SYSTEM VARIABLES WITH LABELS
+# ==============================================================================
+Begin Data Section
+
+# --- CPU HARDWARE INTERFACE ---
+# These addresses are used by the CPU hardware to communicate with the OS
+PC_ADDR@0               0       # Program Counter register - CPU sets this to current instruction
+SP_ADDR@1               999     # Stack Pointer register - CPU uses this for stack operations
+CPU_OS_COMM_ADDR@2      0       # Event communication - CPU sets this when syscall/fault occurs
+INSTR_COUNT_ADDR@3      0       # Instruction counter - CPU increments this after each instruction
+SAVED_TRAP_PC_ADDR@4    0       # When syscall occurs, CPU saves current PC here
+SYSCALL_ARG1_PASS_ADDR@5    0   # First argument for syscalls (e.g., value to print)
+SYSCALL_ARG2_PASS_ADDR@6    0   # Second syscall argument (currently unused)
+SYSCALL_ARG3_PASS_ADDR@7    0   # Third syscall argument (currently unused)
+CPU_OS_COMM_ADDR2@8     0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR3@9     0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR4@10    0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR5@11    0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR6@12    0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR7@13    0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR8@14    0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR9@15    0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR10@16   0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR11@17   0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR12@18   0       # Reserved for future CPU-OS communication
+CPU_OS_COMM_ADDR13@19   0       # Reserved for future CPU-OS communication
+ZERO_ADDR@20            0       # Always contains 0 - used for unconditional jumps
+
+# --- OS CONFIGURATION CONSTANTS ---
+THREAD_STATE_READY@21       1   # Thread is ready to run but not currently running
+THREAD_STATE_RUNNING@22     2   # Thread is currently executing on the CPU
+THREAD_STATE_BLOCKED@23     3   # Thread is waiting (e.g., for I/O like PRN syscall)
+THREAD_STATE_TERMINATED@24  4   # Thread has finished execution (HLT syscall)
+
+BLOCK_TIME_PRN@26           100 # How many instructions to block a thread after PRN syscall
+
+TCB_SIZE@27                 7   # Size of Thread Control Block
+TCB_TABLE_START@28          300 # Memory address where Thread Control Blocks begin
+TOTAL_THREADS@29            4   # Maximum number of threads in the system
+
+# --- OS RUNTIME VARIABLES ---
+CURRENT_THREAD_ID@30        0   # ID of the currently running thread
+NEXT_THREAD_TO_SCHEDULE@31  0   # ID of next thread candidate for scheduling
+TEMP_VAR_1@32               0   # General purpose temporary variable
+TEMP_VAR_2@33               0   # General purpose temporary variable
+TEMP_VAR_3@34               0   # General purpose temporary variable
+NEGATIVE_ONE@35             -1  # Constant -1 value used in calculations
+KERNEL_STACK_POINTER@36     999 # OS uses stack starting at address 999
+SCHEDULER_LOOP_COUNTER@37   0   # Counter for scheduler's thread-finding loop
+TEMP_VAR_4@38               0   # Additional temporary variable
+TEMP_VAR_5@39               0   # Additional temporary variable
+TEMP_VAR_6@40               0   # Additional temporary variable
+
+# --- SYSCALL EVENT CODES ---
+SYSCALL_CODE_PRN@41         1   # Print syscall code
+SYSCALL_CODE_HLT@42         2   # Halt syscall code
+SYSCALL_CODE_YIELD@43       3   # Yield syscall code
+
+# --- SUBROUTINE WORKING MEMORY ---
+MULTIPLY_ARG1@200           0   # First argument for MULTIPLY subroutine
+MULTIPLY_ARG2@201           0   # Second argument for MULTIPLY subroutine
+MULTIPLY_RESULT@202         0   # Result of MULTIPLY subroutine
+MULTIPLY_COUNTER@203        0   # Loop counter used by MULTIPLY subroutine
+ARE_EQUAL_TEMP1@204         0   # Temporary storage for ARE_EQUAL subroutine
+ARE_EQUAL_TEMP2@205         0   # Temporary storage for ARE_EQUAL subroutine
+
+# --- THREAD CONTROL BLOCKS (TCB) TABLE ---
+# Each thread has a 7-word TCB containing: PC, SP, State, BlockUntil, ExecsUsed, StartTime, ID
+
+# TCB for Thread 0 (Operating System Kernel)
+OS_THREAD_PC@300            0   # OS doesn't need saved PC
+OS_THREAD_SP@301            999 # OS stack pointer
+OS_THREAD_STATE@302         2   # RUNNING (OS is always considered running when active)
+OS_THREAD_BLOCK_UNTIL@303   0   # OS never blocks
+OS_THREAD_EXECS_USED@304    0   # Instructions executed by OS
+OS_THREAD_START_TIME@305    0   # When OS thread started
+OS_THREAD_ID@306            0   # Thread ID 0 identifies the OS
+
+# TCB for Thread 1 (User Thread)
+THREAD_1_PC@307             THREAD_1_START  # Starting instruction address for Thread 1
+THREAD_1_SP@308             1999            # Stack pointer for Thread 1
+THREAD_1_STATE@309          1               # READY (ready to run when scheduled)
+THREAD_1_BLOCK_UNTIL@310    0               # Not blocked initially
+THREAD_1_EXECS_USED@311     0               # Instructions executed by this thread
+THREAD_1_START_TIME@312     0               # When thread started executing
+THREAD_1_ID@313             1               # Thread ID 1
+
+# TCB for Thread 2 (User Thread)
+THREAD_2_PC@314             THREAD_2_START  # Starting instruction address for Thread 2
+THREAD_2_SP@315             2999            # Stack pointer for Thread 2
+THREAD_2_STATE@316          1               # READY (ready to run when scheduled)
+THREAD_2_BLOCK_UNTIL@317    0               # Not blocked initially
+THREAD_2_EXECS_USED@318     0               # Instructions executed by this thread
+THREAD_2_START_TIME@319     0               # When thread started executing
+THREAD_2_ID@320             2               # Thread ID 2
+
+# TCB for Thread 3 (User Thread)
+THREAD_3_PC@321             THREAD_3_START  # Starting instruction address for Thread 3
+THREAD_3_SP@322             3999            # Stack pointer for Thread 3
+THREAD_3_STATE@323          1               # READY (ready to run when scheduled)
+THREAD_3_BLOCK_UNTIL@324    0               # Not blocked initially
+THREAD_3_EXECS_USED@325     0               # Instructions executed by this thread
+THREAD_3_START_TIME@326     0               # When thread started executing
+THREAD_3_ID@327             3               # Thread ID 3
+
+# --- USER THREAD DATA AREAS ---
+# THREAD 1 DATA: Array for sorting operations
+THREAD_1_ARRAY_SIZE@1100    5   # Number of elements in the array
+THREAD_1_ARRAY_0@1101       5   # First element of array to sort
+THREAD_1_ARRAY_1@1102       3   # Second element
+THREAD_1_ARRAY_2@1103       4   # Third element
+THREAD_1_ARRAY_3@1104       1   # Fourth element
+THREAD_1_ARRAY_4@1105       2   # Fifth element
+THREAD_1_TEMP_VAR_1@1150    0   # Working variable for Thread 1
+THREAD_1_TEMP_VAR_2@1151    0   # Working variable for Thread 1
+THREAD_1_TEMP_VAR_3@1152    0   # Working variable for Thread 1
+THREAD_1_TEMP_VAR_4@1153    0   # Working variable for Thread 1
+THREAD_1_TEMP_VAR_5@1154    0   # Working variable for Thread 1
+
+# THREAD 2 DATA: Array and variables for search operations
+THREAD_2_ARRAY_SIZE@1200        10      # Number of elements to search through
+THREAD_2_ARRAY_START_ADDR@1201  1202    # Pointer to beginning of search array
+THREAD_2_SEARCH_ARRAY_0@1202    10      # Search array element 0
+THREAD_2_SEARCH_ARRAY_1@1203    20      # Search array element 1
+THREAD_2_SEARCH_ARRAY_2@1204    30      # Search array element 2
+THREAD_2_SEARCH_ARRAY_3@1205    40      # Search array element 3
+THREAD_2_SEARCH_ARRAY_4@1206    50      # Search array element 4
+THREAD_2_SEARCH_ARRAY_5@1207    60      # Search array element 5
+THREAD_2_SEARCH_ARRAY_6@1208    70      # Search array element 6
+THREAD_2_SEARCH_ARRAY_7@1209    80      # Search array element 7
+THREAD_2_SEARCH_ARRAY_8@1210    90      # Search array element 8
+THREAD_2_SEARCH_ARRAY_9@1211    100     # Search array element 9
+THREAD_2_SEARCH_TARGET@1250     70      # Value to search for in the array
+THREAD_2_SEARCH_RESULT@1251     -1      # Index where target found (-1 if not found)
+THREAD_2_CURRENT_INDEX@1260     0       # Current position in search loop
+THREAD_2_CURRENT_VALUE@1261     0       # Current array element being checked
+THREAD_2_TEMP_VAR@1262          0       # Temporary variable for calculations
+
+# THREAD 3 DATA: Custom algorithm variables
+THREAD_3_COUNTER@1300       0   # Loop counter for custom algorithm
+THREAD_3_LIMIT@1301         5   # Maximum value for counter loop
+THREAD_3_PRINT_VALUE@1302   333 # Value to print during each iteration
+THREAD_3_TEMP_VAR@1303      0   # Temporary variable for calculations
+
+End Data Section
+
+
+# ==============================================================================
+# INSTRUCTION SECTION - OPERATING SYSTEM AND USER THREAD CODE
+# ==============================================================================
+Begin Instruction Section
+
+# =============================================
+# OS BOOT SEQUENCE
+# =============================================
+OS_BOOT_START:
+    CPY KERNEL_STACK_POINTER SP_ADDR    # Copy KERNEL_STACK_POINTER to SP_ADDR
+    JIF ZERO_ADDR OS_SCHEDULER          # Jump to scheduler to begin thread management
+
+# =============================================
+# OS SYSCALL DISPATCHER
+# =============================================
+OS_SYSCALL_DISPATCHER:
+    # STEP 1: Save user thread's context (PC and SP) into its TCB
+    CALL GET_CURRENT_TCB_ADDR           
+    STOREI SAVED_TRAP_PC_ADDR TEMP_VAR_3
+    ADD TEMP_VAR_3 1
+    STOREI SP_ADDR TEMP_VAR_3
+    # STEP 2: Switch to kernel stack for safe OS operation
+    CPY KERNEL_STACK_POINTER SP_ADDR    # Load kernel stack pointer into CPU SP register
+    # STEP 3: Determine which syscall was made and handle it
+    CPY CPU_OS_COMM_ADDR TEMP_VAR_1     # Get syscall code from CPU communication register
+    CPY SYSCALL_CODE_PRN TEMP_VAR_2     # Load PRN syscall code for comparison
+    CALL ARE_EQUAL                      # Check if syscall == PRN
+    JIF TEMP_VAR_1 CHECK_FOR_HALT       # If not PRN, check next syscall type
+    JIF ZERO_ADDR OS_HANDLE_PRN         # If PRN, handle print syscall
+
+CHECK_FOR_HALT:
+    CPY CPU_OS_COMM_ADDR TEMP_VAR_1     # Get syscall code again
+    CPY SYSCALL_CODE_HLT TEMP_VAR_2     # Load HLT syscall code for comparison
+    CALL ARE_EQUAL                      # Check if syscall == HLT
+    JIF TEMP_VAR_1 CHECK_FOR_YIELD      # If not HLT, check next syscall type
+    JIF ZERO_ADDR OS_HANDLE_HLT_THREAD  # If HLT, handle thread termination
+
+CHECK_FOR_YIELD:
+    CPY CPU_OS_COMM_ADDR TEMP_VAR_1     # Get syscall code again
+    CPY SYSCALL_CODE_YIELD TEMP_VAR_2   # Load YIELD syscall code for comparison
+    CALL ARE_EQUAL                      # Check if syscall == YIELD
+    JIF TEMP_VAR_1 UNKNOWN_SYSCALL      # If not YIELD, it's an unknown syscall
+    JIF ZERO_ADDR OS_SCHEDULER       # If YIELD, handle voluntary context switch
+
+UNKNOWN_SYSCALL:
+    HLT                                 # Unknown syscall - halt system
+
+# =============================================
+# SYSCALL HANDLERS
+# =============================================
+
+# Handle PRN (Print) syscall - Blocks the calling thread temporarily
+OS_HANDLE_PRN:
+    CALL GET_CURRENT_TCB_ADDR           # TCB pointer is in TEMP_VAR_3
+    ADD TEMP_VAR_3 2                    # Point to State field
+    STOREI THREAD_STATE_BLOCKED TEMP_VAR_3  # CORRECT: Set state in TCB
+    
+    ADD TEMP_VAR_3 1                    # Point to BlockUntil field
+    CPY INSTR_COUNT_ADDR TEMP_VAR_1     # Get current time
+    ADDI TEMP_VAR_1 BLOCK_TIME_PRN      # Calculate wakeup time
+    STOREI TEMP_VAR_1 TEMP_VAR_3          # CORRECT: Set BlockUntil in TCB
+    JIF ZERO_ADDR OS_SCHEDULER
+
+# Handle HLT (Halt) syscall - Terminates the calling thread permanently
+OS_HANDLE_HLT_THREAD:
+    CALL GET_CURRENT_TCB_ADDR           # TCB pointer is in TEMP_VAR_3
+    ADD TEMP_VAR_3 2                    # Point to State field
+    STOREI THREAD_STATE_TERMINATED TEMP_VAR_3 # CORRECT: Set state in TCB
+    JIF ZERO_ADDR OS_SCHEDULER
+
+# Handle YIELD syscall - Voluntarily gives up CPU to other threads
+OS_HANDLE_YIELD:
+    CALL GET_CURRENT_TCB_ADDR           # TCB pointer is in TEMP_VAR_3
+    ADD TEMP_VAR_3 2                    # Point to State field
+    STOREI THREAD_STATE_READY TEMP_VAR_3   # CORRECT: Set state in TCB
+    JIF ZERO_ADDR OS_SCHEDULER
+
+# =============================================
+# OS SCHEDULER
+# =============================================
+# =============================================
+# OS SCHEDULER (ROUND-ROBIN IMPLEMENTATION)
+# =============================================
+# =============================================
+# OS SCHEDULER (CORRECTED ROUND-ROBIN IMPLEMENTATION)
+# =============================================
+OS_SCHEDULER:
+    # --- YIELD HANDLING BLOCK ---
+    # First, check if the scheduler was called because of a YIELD.
+    CPY CPU_OS_COMM_ADDR TEMP_VAR_1
+    CPY SYSCALL_CODE_YIELD TEMP_VAR_2
+    CALL ARE_EQUAL
+    # If the syscall was NOT a YIELD (e.g. from PRN, HLT, or boot), ARE_EQUAL returns 0.
+    # JIF jumps if the value is <= 0, so this will correctly skip the block.
+    JIF TEMP_VAR_1 ROUND_ROBIN_START_SEARCH
+
+    # If we are here, it means a thread has yielded. We must save its context.
+    # The CURRENT_THREAD_ID is still the ID of the thread that just yielded.
+    CALL GET_CURRENT_TCB_ADDR           # Get TCB base address into TEMP_VAR_3
+
+    # Action 1: Save the return PC into the TCB's PC field.
+    STOREI SAVED_TRAP_PC_ADDR TEMP_VAR_3
+
+    # Action 2: Set the thread's state to READY.
+    # The TCB layout is [PC, SP, State, ...]. State is at offset +2.
+    ADD TEMP_VAR_3 2                    # Move pointer from TCB base to the State field
+    STOREI THREAD_STATE_READY TEMP_VAR_3  # Set State to READY
+
+ROUND_ROBIN_START_SEARCH:
+    # --- ROUND-ROBIN LOGIC: START SEARCH FROM NEXT THREAD ---
+    # This logic is the same as before.
+    CPY CURRENT_THREAD_ID NEXT_THREAD_TO_SCHEDULE
+    ADD NEXT_THREAD_TO_SCHEDULE 1
+    
+    # Check for wrap-around from last thread back to thread 1.
+    CPY NEXT_THREAD_TO_SCHEDULE TEMP_VAR_1
+    CPY TOTAL_THREADS TEMP_VAR_2
+    CALL ARE_EQUAL
+    JIF TEMP_VAR_1 FIND_LOOP_START_POINT
+    SET 1 NEXT_THREAD_TO_SCHEDULE
+
+FIND_LOOP_START_POINT:
+    SET 0 SCHEDULER_LOOP_COUNTER
+
+SCHEDULER_FIND_LOOP:
+    # Check if we've looped through all threads without finding one.
+    CPY SCHEDULER_LOOP_COUNTER TEMP_VAR_1
+    CPY TOTAL_THREADS TEMP_VAR_2
+    CALL ARE_EQUAL
+    JIF TEMP_VAR_1 GET_NEXT_TCB_AND_STATE
+    JIF ZERO_ADDR OS_HALT
+
+GET_NEXT_TCB_AND_STATE:
+    # This logic is also the same as before.
+    CPY NEXT_THREAD_TO_SCHEDULE TEMP_VAR_1
+    CALL GET_TCB_ADDR_FOR_ID
+    CPY TEMP_VAR_3 TEMP_VAR_4
+    ADD TEMP_VAR_4 2
+    LOADI TEMP_VAR_4 TEMP_VAR_2
+
+    # 1. Check if the thread is BLOCKED
+    CPY THREAD_STATE_BLOCKED TEMP_VAR_1
+    CALL ARE_EQUAL
+    JIF TEMP_VAR_1 SCHEDULER_CHECK_READY
+
+    ADD TEMP_VAR_4 1
+    LOADI TEMP_VAR_4 TEMP_VAR_1
+    CPY INSTR_COUNT_ADDR TEMP_VAR_2
+    SUBI TEMP_VAR_1 TEMP_VAR_2
+    JIF TEMP_VAR_2 UNBLOCK_AND_DISPATCH
+    JIF ZERO_ADDR SCHEDULER_LOOP_NEXT
+
+SCHEDULER_CHECK_READY:
+    # 2. Check if the thread is READY
+    CPY THREAD_STATE_READY TEMP_VAR_1
+    CALL ARE_EQUAL
+    JIF TEMP_VAR_1 SCHEDULER_LOOP_NEXT
+    JIF ZERO_ADDR OS_DISPATCH_THREAD
+
+UNBLOCK_AND_DISPATCH:
+    # 3. Unblock the thread and then dispatch it
+    ADD TEMP_VAR_4 -1
+    STOREI THREAD_STATE_READY TEMP_VAR_4
+    JIF ZERO_ADDR OS_DISPATCH_THREAD
+
+SCHEDULER_LOOP_NEXT:
+    # 4. Advance to the next thread in the round-robin circle.
+    ADD SCHEDULER_LOOP_COUNTER 1
+    ADD NEXT_THREAD_TO_SCHEDULE 1
+    
+    CPY NEXT_THREAD_TO_SCHEDULE TEMP_VAR_1
+    CPY TOTAL_THREADS TEMP_VAR_2
+    CALL ARE_EQUAL
+    JIF TEMP_VAR_1 SCHEDULER_FIND_LOOP
+    SET 1 NEXT_THREAD_TO_SCHEDULE
+    JIF ZERO_ADDR SCHEDULER_FIND_LOOP
+
+# Dispatcher remains the same
+OS_DISPATCH_THREAD:
+    CPY NEXT_THREAD_TO_SCHEDULE CURRENT_THREAD_ID
+    CPY CURRENT_THREAD_ID TEMP_VAR_1
+    CALL GET_TCB_ADDR_FOR_ID
+    CPY TEMP_VAR_3 TEMP_VAR_4
+    # The dispatcher uses LOADI which is correct: mem[Dest] = mem[mem[Ptr_Addr]]
+    # It loads the PC value from the TCB into the PC_ADDR register.
+    LOADI TEMP_VAR_4 PC_ADDR
+    ADD  TEMP_VAR_4 1
+    LOADI TEMP_VAR_4 SP_ADDR
+    ADD  TEMP_VAR_4 1
+    # Set the state of the *dispatched* thread to RUNNING
+    STOREI THREAD_STATE_RUNNING TEMP_VAR_4
+    USER PC_ADDR
+
+
+OS_HALT:
+    HLT
+
+# =============================================
+# SUBROUTINES
+# =============================================
+
+# MULTIPLY: Multiplies MULTIPLY_ARG1 by MULTIPLY_ARG2. Result in MULTIPLY_RESULT.
+MULTIPLY:
+    CPY MULTIPLY_ARG1 MULTIPLY_COUNTER  # counter = arg1
+    SET 0 MULTIPLY_RESULT               # Zero out the result register
+
+MULTIPLY_LOOP:
+    JIF MULTIPLY_COUNTER MULTIPLY_END   # if counter <= 0, end
+    ADDI MULTIPLY_RESULT MULTIPLY_ARG2  # CORRECTION: Add the second argument (arg2) directly.
+    ADD MULTIPLY_COUNTER -1             # counter--
+    JIF ZERO_ADDR MULTIPLY_LOOP
+
+MULTIPLY_END:
+    RET
+
+# GET_TCB_ADDR_FOR_ID: Input: TEMP_VAR_1 = thread_id, Output: TEMP_VAR_3 = TCB address
+# This new version uses direct labels for efficiency, avoiding runtime multiplication.
+# GET_TCB_ADDR_FOR_ID: Input: TEMP_VAR_1 = thread_id, Output: TEMP_VAR_3 = TCB address
+#
+# BUG-FIXED VERSION: This version preserves the original Thread ID argument by
+# re-loading it for each comparison, since ARE_EQUAL modifies its arguments.
+#
+GET_TCB_ADDR_FOR_ID:
+    # --- Store original ID to be safe ---
+    CPY TEMP_VAR_1 TEMP_VAR_4          # Save original ID in TEMP_VAR_4
+
+    # Check if Thread ID is 1
+    CPY TEMP_VAR_4 TEMP_VAR_1           # Restore original ID for comparison
+    SET 1 TEMP_VAR_2
+    CALL ARE_EQUAL                      # Is ID == 1?
+    JIF TEMP_VAR_1 CHECK_ID_2           # If not, check for ID 2
+    SET THREAD_1_PC TEMP_VAR_3          # It is 1. Load address of TCB 1
+    JIF ZERO_ADDR GET_TCB_DONE          # Unconditional jump to return
+
+CHECK_ID_2:
+    # Check if Thread ID is 2
+    CPY TEMP_VAR_4 TEMP_VAR_1           # Restore original ID for comparison
+    SET 2 TEMP_VAR_2
+    CALL ARE_EQUAL                      # Is ID == 2?
+    JIF TEMP_VAR_1 CHECK_ID_3           # If not, check for ID 3
+    SET THREAD_2_PC TEMP_VAR_3          # It is 2. Load address of TCB 2
+    JIF ZERO_ADDR GET_TCB_DONE          # Unconditional jump to return
+
+CHECK_ID_3:
+    # Check if Thread ID is 3
+    CPY TEMP_VAR_4 TEMP_VAR_1           # Restore original ID for comparison
+    SET 3 TEMP_VAR_2
+    CALL ARE_EQUAL                      # Is ID == 3?
+    JIF TEMP_VAR_1 GET_TCB_DONE         # If not, it's an unknown ID, just return
+    SET THREAD_3_PC TEMP_VAR_3          # It is 3. Load address of TCB 3
+
+GET_TCB_DONE:
+    RET
+
+# GET_CURRENT_TCB_ADDR: Output: TEMP_VAR_3 = address of the TCB for the current thread
+GET_CURRENT_TCB_ADDR:
+    CPY CURRENT_THREAD_ID TEMP_VAR_1    # Load current thread ID
+    CALL GET_TCB_ADDR_FOR_ID
+    RET
+
+ARE_EQUAL:
+    # Save input values A and B to temporary locations
+    CPY TEMP_VAR_1 ARE_EQUAL_TEMP1      # ARE_EQUAL_TEMP1 = A (preserve original)
+    CPY TEMP_VAR_2 ARE_EQUAL_TEMP2      # ARE_EQUAL_TEMP2 = B (preserve original)
+
+    # First check: Is A <= B?
+    # Make working copies to avoid destroying saved values
+    CPY ARE_EQUAL_TEMP1 TEMP_VAR_4      # TEMP_VAR_4 = A (working copy)
+    CPY ARE_EQUAL_TEMP2 TEMP_VAR_5      # TEMP_VAR_5 = B (working copy)
+    
+    # Calculate A - B using working copies
+    SUBI TEMP_VAR_4 TEMP_VAR_5          # TEMP_VAR_5 now contains (A - B)
+    JIF TEMP_VAR_5 ARE_EQUAL_CHECK_SECOND_CONDITION
+
+    # If A - B > 0, then A > B, so not equal
+    SET 0 TEMP_VAR_1
+    RET
+
+ARE_EQUAL_CHECK_SECOND_CONDITION:
+    # We get here only if A <= B. Now check if B <= A.
+    # Use the preserved original values (NOT current TEMP_VAR_1/2 which may be modified)
+    CPY ARE_EQUAL_TEMP2 TEMP_VAR_4      # TEMP_VAR_4 = B (working copy)
+    CPY ARE_EQUAL_TEMP1 TEMP_VAR_5      # TEMP_VAR_5 = A (working copy)
+
+    # Calculate B - A using working copies  
+    SUBI TEMP_VAR_4 TEMP_VAR_5          # TEMP_VAR_5 now contains (B - A)
+    JIF TEMP_VAR_5 ARE_EQUAL_THEY_ARE_EQUAL
+
+    # If B - A > 0, then B > A, so not equal
+    SET 0 TEMP_VAR_1
+    RET
+
+ARE_EQUAL_THEY_ARE_EQUAL:
+    # We get here if both (A <= B) AND (B <= A), which means A == B
+    SET 1 TEMP_VAR_1
+    RET
+
+
+# --- FAULT HANDLERS ---
+OS_MEMORY_FAULT_HANDLER_PC:
+    SYSCALL PRN 5
+    HLT
+
+OS_ARITHMETIC_FAULT_HANDLER_PC:
+    SET 666 TEMP_VAR_1
+    SYSCALL PRN TEMP_VAR_1
+    HLT
+
+OS_UNKNOWN_INSTRUCTION_HANDLER_PC:
+    SET 777 TEMP_VAR_1
+    SYSCALL PRN TEMP_VAR_1
+    HLT
+
+# ==============================================================================
+# THREAD 1: SELECTION SORT IMPLEMENTATION
+# ==============================================================================
+THREAD_1_START:
+    # Simple test with yields between prints
+    SET 111 THREAD_1_TEMP_VAR_1         # Test separator
+    SYSCALL PRN THREAD_1_TEMP_VAR_1     # Print separator
+    SYSCALL YIELD                       # Give control back to OS
+    SYSCALL PRN THREAD_1_ARRAY_0        # Print array[0] = 5
+    SYSCALL YIELD                       # Give control back to OS
+    SYSCALL PRN THREAD_1_ARRAY_1        # Print array[1] = 3
+    SYSCALL YIELD                       # Give control back to OS
+    SET 222 THREAD_1_TEMP_VAR_1         # End separator
+    SYSCALL PRN THREAD_1_TEMP_VAR_1     # Print end separator
+    SYSCALL HLT                         # Done
+
+# ==============================================================================
+# THREAD 2: LINEAR SEARCH IMPLEMENTATION
+# ==============================================================================
+THREAD_2_START:
+    SET 0 THREAD_2_CURRENT_INDEX        # Initialize current_index = 0
+
+SEARCH_LOOP:
+    # Check if we've searched all elements (index >= array_size)
+    CPY THREAD_2_CURRENT_INDEX TEMP_VAR_1           # TEMP_VAR_1 = current_index
+    CPY THREAD_2_ARRAY_SIZE TEMP_VAR_2              # TEMP_VAR_2 = array_size
+    CALL ARE_EQUAL                                  # Check if index == size. Result in TEMP_VAR_1 (1=true, 0=false)
+
+    # ARE_EQUAL sets TEMP_VAR_1 to 1 if they are equal.
+    # We want to JUMP if they are equal (to SEARCH_NOT_FOUND).
+    # But JIF jumps if the value is <= 0.
+    # So we need to flip the logic: if they are NOT equal (result is 0), continue the loop.
+    JIF TEMP_VAR_1 SEARCH_CONTINUE                  # If result is 0 (not equal), continue loop.
+    JIF ZERO_ADDR SEARCH_NOT_FOUND 
+
+SEARCH_CONTINUE:
+    # Calculate array address: array_start_addr + current_index
+    CPY THREAD_2_ARRAY_START_ADDR TEMP_VAR_2        # Load array_start_addr
+    ADDI TEMP_VAR_2 THREAD_2_CURRENT_INDEX          # Add current_index
+    LOADI TEMP_VAR_2 THREAD_2_CURRENT_VALUE          # Load array[index] value
+    
+    # Compare current array element with target value
+    CPY THREAD_2_CURRENT_VALUE TEMP_VAR_1           # Load current_value for comparison
+    CPY THREAD_2_SEARCH_TARGET TEMP_VAR_2           # Load search_target
+    CALL ARE_EQUAL                                  # Check if equal (result in TEMP_VAR_1)
+    JIF TEMP_VAR_1 SEARCH_LOOP_NEXT                 # If not equal, continue to next element
+    JIF ZERO_ADDR SEARCH_FOUND                      # If equal, we found it!
+
+SEARCH_LOOP_NEXT:
+    ADD THREAD_2_CURRENT_INDEX 1                    # Increment current_index
+    SYSCALL YIELD                                   # Give other threads a chance to run
+    JIF ZERO_ADDR SEARCH_LOOP                       # Continue search loop
+
+SEARCH_FOUND:
+    # Target found! Store index in result variable and print it
+    CPY THREAD_2_CURRENT_INDEX THREAD_2_SEARCH_RESULT  # Store found index
+    SYSCALL PRN THREAD_2_SEARCH_RESULT              # Print the index where target was found
+    SYSCALL HLT                                     # Terminate this thread
+
+SEARCH_NOT_FOUND:
+    # Target not found in array, print -1
+    SYSCALL PRN THREAD_2_SEARCH_RESULT              # Print -1 to indicate not found
+    SYSCALL HLT                                     # Terminate this thread
+
+# ==============================================================================
+# THREAD 3: CUSTOM ALGORITHM - COUNTDOWN PRINTER
+# ==============================================================================
+THREAD_3_START:
+    SET 0 THREAD_3_COUNTER              # Initialize counter = 0
+
+CUSTOM_LOOP:
+    # Check if we have reached the limit (if counter == limit, stop)
+    CPY THREAD_3_COUNTER TEMP_VAR_1                 # TEMP_VAR_1 = counter
+    CPY THREAD_3_LIMIT TEMP_VAR_2                   # TEMP_VAR_2 = limit
+    CALL ARE_EQUAL                                  # Check if counter == limit. Result in TEMP_VAR_1
+
+    # As before, JIF jumps if the result is <= 0.
+    # If they are NOT equal, ARE_EQUAL returns 0. So we continue.
+    JIF TEMP_VAR_1 CUSTOM_CONTINUE                  # If result is 0 (not equal), continue loop.
+    # If they ARE equal, ARE_EQUAL returns 1. We fall through to the jump.
+    JIF ZERO_ADDR CUSTOM_DONE                       # If result is 1 (equal), we are done.
+
+CUSTOM_CONTINUE:
+    # Print the special value and increment counter
+    SYSCALL PRN THREAD_3_PRINT_VALUE               # Print the special value (333)
+    ADD THREAD_3_COUNTER 1                          # Increment counter
+    SYSCALL YIELD                                   # Give other threads a chance to run
+    JIF ZERO_ADDR CUSTOM_LOOP                       # Continue the loop
+
+CUSTOM_DONE:
+    # Loop completed, terminate this thread
+    SYSCALL HLT                                     # Terminate this thread
+
+End Instruction Section 

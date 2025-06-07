@@ -2,13 +2,24 @@
 #ifndef CPU_H
 #define CPU_H
 
-#include "memory.h"
-#include "instruction.h" // For Instruction and OpCode definitions
-#include "common.h"      // For memory layout constants and CpuEvent
-#include <vector>
-#include <string>
-#include <functional> // For std::function (to handle PRN syscall output)
-#include <stdexcept>  // For std::runtime_error
+#include "common.h"      // For memory layout constants and CpuEvent - needed for inlines
+#include <functional>    // For std::function - needed for member
+#include <stdexcept>     // For std::runtime_error - needed for exceptions
+#include <vector>        // For std::vector<Instruction> member - required for member variables
+
+// Forward declarations to reduce compilation dependencies
+class Memory;
+struct Instruction;
+enum class OpCode;
+
+class UserMemoryFaultException : public std::runtime_error
+{
+public:
+    UserMemoryFaultException(const std::string& msg, long addr)
+        : std::runtime_error(msg), faulting_address(addr) {}
+    
+    long faulting_address;
+};
 
 class CPU
 {
@@ -38,6 +49,7 @@ private:
 
     bool halted_flag_;    // True if CPU HLT instruction has been executed
     bool user_mode_flag_; // True if CPU is in user mode, false for kernel mode
+    bool pc_modified_by_data_operation_;
 
     // Helper methods for memory access with user mode protection
     long privilegedRead(long address); // Internal read, bypasses user mode checks for registers
@@ -50,26 +62,13 @@ private:
     long getSP() const;
     void setSP(long new_sp);
     void incrementInstructionCounter();
-    void setCpuEvent(CpuEvent event)
-    {
-        memory_.write(CPU_OS_COMM_ADDR, static_cast<long>(event));
-    }
-    // Removed setSystemCallResult, using memory_.write(CPU_OS_COMM_ADDR, ...) directly with CpuEvent.
+    void setCpuEvent(CpuEvent event);
 };
 
-// Custom exception for user mode memory access violations
-class UserMemoryFaultException : public std::runtime_error
-{
-public:
-    long faulting_address;
-    UserMemoryFaultException(const std::string &msg, long addr) : std::runtime_error(msg), faulting_address(addr) {}
-};
-
-// Custom exception for arithmetic faults (New)
+// Custom exception for arithmetic faults
 class ArithmeticFaultException : public std::runtime_error {
 public:
     ArithmeticFaultException(const std::string& msg) : std::runtime_error(msg) {}
 };
-
 
 #endif // CPU_H

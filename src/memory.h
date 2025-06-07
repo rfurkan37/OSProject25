@@ -2,18 +2,16 @@
 #ifndef MEMORY_H
 #define MEMORY_H
 
-#include <vector>
-#include <string>
-#include <iostream>  // For std::ostream
-#include <stdexcept> // For std::out_of_range, std::invalid_argument
-#include <fstream>   // For std::ifstream
+#include <stdexcept> // For std::out_of_range, std::invalid_argument - needed for exceptions
+#include <iosfwd>    // Forward declarations for stream types
+#include <vector>    // For std::vector<long> member - required for member variables
 
 class Memory
 {
 public:
     // Constructor: Initializes memory of a given size with all zeros.
     // Minimum size of 11000 to accommodate OS and 10 threads' basic data segments.
-    Memory(size_t initialSize = 11000);
+    explicit Memory(size_t initialSize = 11000);
 
     // Reads a long value from the specified memory address.
     // Throws std::out_of_range if address is invalid.
@@ -36,12 +34,16 @@ public:
     // Ensures startAddr and endAddr are within valid bounds.
     void dumpMemoryRange(std::ostream &out, long startAddr, long endAddr) const;
 
+    // Dumps memory contents in a compact table format (10 columns per row).
+    // More organized and space-efficient than dumpMemoryRange for viewing large ranges.
+    void dumpMemoryRangeTable(std::ostream &out, long startAddr, long endAddr) const;
+
     // Dumps predefined important regions to the output stream.
     // This is a utility function for debugging, typically showing registers and OS areas.
     void dumpImportantRegions(std::ostream &out) const;
 
     // Returns the total size of the memory (number of long locations).
-    size_t getSize() const;
+    size_t getSize() const { return size_; }
 
     // Clears all memory to zero.
     void clear();
